@@ -257,11 +257,13 @@ class Sampler:
             self.bbobj._update_profile(rings)
 
         # Calculate the model and the boundaries
-        model, bhi, blo, galmod = self.bbobj._calculate_model(rings)
-        
+        model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
+
         # Calculate the residuals
-        mask = self.bbobj.mask[:, blo[1]:bhi[1], blo[0]:bhi[0]]
-        data = self.bbobj.data[:, blo[1]:bhi[1], blo[0]:bhi[0]]
+        mask = self.bbobj.mask.copy() # [:, blo[1]:bhi[1], blo[0]:bhi[0]]
+        data = self.bbobj.data.copy() # [:, blo[1]:bhi[1], blo[0]:bhi[0]]
+
+        data_ = data[:, blo[1]:bhi[1], blo[0]:bhi[0]].copy()
 
         kwargs = {}
         if self.method_norm == "constant":
@@ -272,7 +274,10 @@ class Sampler:
             kwargs["rings"] = rings
             kwargs["bhi"], kwargs["blo"] = bhi, blo
 
-        model = self._normalize_model(model, data, **kwargs)
+        model_ = self._normalize_model(model_, data_, **kwargs)
+
+        model = np.zeros(self.data.shape)
+        model[:, blo[1]:bhi[1], blo[0]:bhi[0]] = model_.copy()
 
         # Convolve with the beam after normalization (pure Python to avoid
         # C++ Smooth3D heap operations that corrupt malloc in forked processes)
