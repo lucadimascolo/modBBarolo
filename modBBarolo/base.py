@@ -276,7 +276,7 @@ class Sampler:
 
         model_ = self._normalize_model(model_, data_, **kwargs)
 
-        model = np.zeros(self.data.shape)
+        model = np.zeros(data.shape)
         model[:, blo[1]:bhi[1], blo[0]:bhi[0]] = model_.copy()
 
         # Convolve with the beam after normalization (pure Python to avoid
