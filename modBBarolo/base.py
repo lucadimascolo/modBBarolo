@@ -411,6 +411,8 @@ class Sampler:
             print ("Sampler has not been run yet. Please run compute() before running this function.")
             return
 
+        model, _, _ = self._get_model(self.params)
+
         rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
 
         libBB.Galfit_setOutRings(self.bbobj._galfit,rings._rings)
@@ -423,8 +425,6 @@ class Sampler:
         blo = (ctypes.c_int * 2)(0, 0)
     
         galmod = libBB.Galfit_getModel(self.bbobj._galfit,rings._rings,bhi,blo,True)
-
-        model, _, _ = self._get_model(self.params)
 
         buffer = reshapePointer(libBB.Galmod_array(galmod), model.shape)
         buffer[:] = model
