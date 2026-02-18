@@ -407,54 +407,28 @@ class Sampler:
 # - Save best-fit model and outputs using the best-fit parameters
 # -----------------------------------------------------------------------------
     def save_best_model(self,plots=True,**kwargs):
-            
         if not self.bbobj.modCalculated:
             print ("Sampler has not been run yet. Please run compute() before running this function.")
             return
-        
-        # Creating a new Rings object for the outputs
-        self.bbobj.outri = Rings(self.bbobj._inri.nr)
-        self.bbobj.outri.set_rings_from_dict(self.bbobj._inri.r)
 
-        if not hasattr(self.bbobj, "params"):
-            self.bbobj.params = self.params[:len(self.bbobj.freepar_names)]
+        rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
 
-        # Updating output rings with best parameters from the sampling
-        self.bbobj.outri = self.bbobj._update_rings(self.bbobj.outri,self.bbobj.params)
-    
-        # Setting up the output rings in the Galfit object.
-        libBB.Galfit_setOutRings(self.bbobj._galfit,self.bbobj.outri._rings)
+        libBB.Galfit_setOutRings(self.bbobj._galfit,rings._rings)
 
-        self.bbobj._update_profile(self.bbobj.outri)
+        if self.bbobj.update_prof:
+            self.bbobj._update_profile(rings)
 
-        # Deriving the last model
         _, ys, xs = self.bbobj.data.shape
-        bhi, blo = (ctypes.c_int * 2)(xs,ys), (ctypes.c_int * 2)(0)
-        galmod = libBB.Galfit_getModel(self.bbobj._galfit,self.bbobj.outri._rings,bhi,blo,True)
-
-        kwargs = {}
-        if self.method_norm == "constant":
-            kwargs["norm"] = self.params[self.freepar_idx["norm"]]
-        elif self.method_norm == "exponential":
-            kwargs["norm"]  = self.params[self.freepar_idx["norm"]]
-            kwargs["rdisk"] = self.params[self.freepar_idx["rdisk"]]
-            kwargs["rings"] = self.bbobj.outri
-            kwargs["bhi"], kwargs["blo"] = bhi, blo
-
-        # Reshaping the model to the correct 3D shape
-        model = reshapePointer(libBB.Galmod_array(galmod),self.bbobj.data.shape)
-        # Normalizing and copying it back to the C++ Galmod object
-
-        model = self._normalize_model(model, self.bbobj.data, **kwargs)
-
-        # Convolve with the beam after normalization
-        model = self._smooth_model(model)
-
-        # Copy smoothed model into the C++ buffer for output writing
-        _cpp_buf = reshapePointer(libBB.Galmod_array(galmod), model.shape)
-        _cpp_buf[:] = model
-
-        # Writing all the outputs
-        libBB.Galfit_writeOutputs(self.bbobj._galfit,galmod,self.bbobj._ellprof,plots)
+        bhi = (ctypes.c_int * 2)(xs, ys)
+        blo = (ctypes.c_int * 2)(0, 0)
     
+        galmod = libBB.Galfit_getModel(self.bbobj._galfit,rings._rings,bhi,blo,True)
+
+        model, _, _ = self._get_model(self.params)
+
+        buffer = reshapePointer(libBB.Galmod_array(galmod), model.shape)
+        buffer[:] = model
+
+        libBB.Galfit_writeOutputs(self.bbobj._galfit,galmod,self.bbobj._ellprof,plots)
+        libBB.Galmod_delete(galmod)
         plt.close()
