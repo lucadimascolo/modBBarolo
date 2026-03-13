@@ -8,14 +8,13 @@ import nautilus
 import corner
 
 import inspect
+import types
 from datetime import datetime
 
 import numpy as np
-import scipy.stats
-from scipy.signal import fftconvolve
-from astropy.io import fits as pyfits
+from astropy.io import fits
 
-from .likelihood import LL_Normal
+from .likelihood import Normal
 
 import multiprocess
 
@@ -41,32 +40,208 @@ _active_sampler = None
 # Initialize BBarolo
 # -----------------------------------------------------------------------------
 class Init(BayesianBBarolo):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, fitsname, beam=None, normalize_beam=None, *args, **kwargs):
+        super().__init__(fitsname, *args, **kwargs)
+
+        self._beam_kernel = None
+        self._beam_kernel_fft = None
+        self._beam_fft_shape = None
+
+        self._add_zero = False
         self._vrot_r0_removed_idx = None
         self._full_freepar_idx = None
 
-    def initialize(self, rsep, rnum, init={}, set_options={}):
-        self.radii = np.linspace(0.00, rsep * (rnum - 1), rnum)
+        if beam is not None:
+            if isinstance(beam, str):
+                self.add_beam_from_fits(beam, normalize=normalize_beam)
+            elif isinstance(beam, bool) and beam:
+                normalize = 'sum' if normalize_beam is None else normalize_beam
+                self.build_beam_from_header(normalize=normalize)
+            else:
+                raise ValueError("Invalid value for 'beam' argument.")
+
+
+    def initialize(self, rsep, rnum, init={}, set_options={}, add_zero=False):
+        self._add_zero = add_zero
+
+        self.radii = np.linspace(
+            0.50 * rsep, 0.50 * rsep * (1.00 + 2.00 * (rnum - 1.00)), rnum
+        )
         self.rsep = rsep
+
+        if add_zero:
+            self.radii = np.concatenate([[0.0], self.radii])
 
         self.init(radii=self.radii, **init)
 
         self.set_options(**set_options)
 
+
     def _setup(self, freepar, **kwargs):
         super()._setup(freepar, **kwargs)
 
+        if self._add_zero and "vrot" in self.freepar_idx and len(self.freepar_idx["vrot"]) > 1:
+            self._full_freepar_idx = {k: v.copy() for k, v in self.freepar_idx.items()}
+
+            removed_idx = int(self.freepar_idx["vrot"][0])
+            self._vrot_r0_removed_idx = removed_idx
+
+            # Drop the r=0 entry from vrot's index list
+            self.freepar_idx["vrot"] = self.freepar_idx["vrot"][1:]
+
+            # Shift down all theta indices that sit above the removed slot
+            for key in self.freepar_idx:
+                self.freepar_idx[key] = np.where(
+                    self.freepar_idx[key] > removed_idx,
+                    self.freepar_idx[key] - 1,
+                    self.freepar_idx[key],
+                )
+
+            self.freepar_names = [n for n in self.freepar_names if n != "vrot1"]
+            self.ndim -= 1
+
+
     def _update_rings(self, rings, theta):
         if self._vrot_r0_removed_idx is not None:
+            # Reinsert vrot=0 at the r=0 position before delegating to parent
             theta = np.insert(theta, self._vrot_r0_removed_idx, 0.0)
+
             saved_idx = self.freepar_idx
             self.freepar_idx = self._full_freepar_idx
             result = super()._update_rings(rings, theta)
             self.freepar_idx = saved_idx
             return result
-        else:
-            return super()._update_rings(rings, theta)
+
+        return super()._update_rings(rings, theta)
+
+
+    # -------------------------------------------------------------------------
+    # - Import beam kernel from a FITS
+    # -------------------------------------------------------------------------
+    def add_beam_from_fits(self, fname, normalize=None):
+        with fits.open(fname) as hdu:
+            kernel = hdu[0].data.copy()
+
+        # Strip degenerate leading axes (e.g. FITS shape (1, ky, kx) → (ky, kx))
+        while kernel.ndim > 2 and kernel.shape[0] == 1:
+            kernel = kernel[0]
+
+        self._beam_kernel = kernel
+
+        if normalize is not None:
+            self._normalize_kernel(normalize)
+
+
+    # -------------------------------------------------------------------------
+    # - Build beam kernel from FITS header (using BBarolo's convention)
+    # -------------------------------------------------------------------------
+    def build_beam_from_header(self, normalize=None):
+        self._beam_kernel = self._build_bb_beam()
+
+        if normalize is not None:
+            self._normalize_kernel(normalize)
+
+
+    def _build_single_kernel(self, bmaj, bmin, bpa, pixsizeX, pixsizeY):
+        """Build one 2D Gaussian kernel matching BBarolo's cfield construction."""
+        # BBarolo convention: convolving from point beam (0,0,0) to target beam
+        # gives Con = {bmaj, bmin, bpa-90}
+        phi = np.radians(bpa - 90.0)
+        cs, sn = np.cos(phi), np.sin(phi)
+
+        # Kernel extent (same factor as BBarolo: sqrt(-log(1e-4)/log(2)))
+        extend = np.sqrt(-np.log(1e-4) / np.log(2.0))
+        xr_ext = 0.5 * bmaj * extend
+        yr_ext = 0.5 * bmin * extend
+
+        x_max = max(abs(xr_ext * cs), abs(yr_ext * sn))
+        y_max = max(abs(xr_ext * sn), abs(yr_ext * cs))
+
+        Xmax = round(x_max / pixsizeX)
+        Ymax = round(y_max / pixsizeY)
+
+        ii, jj = np.meshgrid(np.arange(-Xmax, Xmax + 1), np.arange(-Ymax, Ymax + 1))
+        x, y = ii * pixsizeX, jj * pixsizeY
+
+        xr = x * cs + y * sn
+        yr = -x * sn + y * cs
+
+        argfac = -4.0 * np.log(2.0)
+        argX = (xr / bmaj) if bmaj != 0 else np.zeros_like(xr)
+        argY = (yr / bmin) if bmin != 0 else np.zeros_like(yr)
+        kernel = np.exp(argfac * (argX**2 + argY**2))
+        kernel[kernel < 1e-4] = 0
+        return kernel
+
+
+    def _build_bb_beam(self):
+        """Build beam kernel(s) matching BBarolo's cfield construction.
+
+        Returns a 2D array (ky, kx) for a uniform beam, or a 3D array
+        (nchans, ky, kx) when the beam varies across the frequency axis
+        (read from a BEAMS binary-table extension, CASA convention).
+        """
+        hdr = fits.getheader(self.inp.fname)
+        pixsizeX = abs(hdr["CDELT1"]) * 3600  # degrees -> arcsec
+        pixsizeY = abs(hdr["CDELT2"]) * 3600  # degrees -> arcsec
+
+        # Per-channel beam: CASA writes a BEAMS binary-table extension
+        try:
+            with fits.open(self.inp.fname) as hdul:
+                beams = hdul["BEAMS"].data
+            bmaj_arr = beams["BMAJ"] * 3600  # degrees -> arcsec
+            bmin_arr = beams["BMIN"] * 3600
+            bpa_arr  = beams["BPA"]
+        except KeyError:
+            bmaj_arr = np.array([hdr["BMAJ"] * 3600])
+            bmin_arr = np.array([hdr["BMIN"] * 3600])
+            bpa_arr  = np.array([hdr.get("BPA", 0)])
+
+        kernels = [
+            self._build_single_kernel(bmaj, bmin, bpa, pixsizeX, pixsizeY)
+            for bmaj, bmin, bpa in zip(bmaj_arr, bmin_arr, bpa_arr)
+        ]
+
+        if len(kernels) == 1:
+            return kernels[0]
+
+        max_ky = max(k.shape[0] for k in kernels)
+        max_kx = max(k.shape[1] for k in kernels)
+
+        padded = []
+        for k in kernels:
+            pad_y = (max_ky - k.shape[0]) // 2
+            pad_x = (max_kx - k.shape[1]) // 2
+            padded.append(np.pad(k, ((pad_y, max_ky - k.shape[0] - pad_y),
+                                     (pad_x, max_kx - k.shape[1] - pad_x))))
+
+        return np.stack(padded)
+
+
+    def _normalize_kernel(self, normalize="sum"):
+        if normalize == "sum":
+            if self._beam_kernel.ndim == 2:
+                self._beam_kernel /= self._beam_kernel.sum()
+            else:
+                self._beam_kernel /= self._beam_kernel.sum(axis=(-2, -1), keepdims=True)
+        elif normalize == "peak":
+            if self._beam_kernel.ndim == 2:
+                self._beam_kernel /= self._beam_kernel.max()
+            else:
+                self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
+
+
+    def _build_fft_beam(self):
+        _, ny, nx = self.data.shape
+        ky, kx = self._beam_kernel.shape[-2], self._beam_kernel.shape[-1]
+
+        fshape_y = ny + ky - 1
+        fshape_x = nx + kx - 1
+
+        self._beam_fft_shape = (fshape_y, fshape_x)
+        self._beam_kernel_fft = np.fft.rfft2(
+            self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -84,9 +259,13 @@ def _mp_prior_transform(u):
 # Sampler class
 # -----------------------------------------------------------------------------
 class Sampler:
-    _log_likelihood = LL_Normal
-
-    def __init__(self, bbobj, free_params, method_norm="constant", output=None):
+    def __init__(self,
+        bbobj,
+        free_params,
+        likelihood=Normal,
+        method_norm="constant",
+        output=None
+    ):
         self.bbobj = bbobj
         self.free_params = free_params
         self.method_norm = method_norm
@@ -132,7 +311,7 @@ class Sampler:
             )
 
         elif self.method_norm == "exponential":
-            hdr = pyfits.getheader(self.bbobj.inp.fname)
+            hdr = fits.getheader(self.bbobj.inp.fname)
             self.pixscale = abs(hdr["CDELT2"]) * 3600
             del hdr
 
@@ -149,68 +328,36 @@ class Sampler:
                     self.bbobj.priors[pname]["name"], **distr_kwargs
                 )
 
-        self.rms = None
+        if self.bbobj._beam_kernel is None:
+            print(
+                "Warning. No beam kernel has been built. If your data is beam-convolved, "
+                "please run 'bbobj.build_beam_from_header()' before loading the sampler."
+            )
+        else:
+            self.bbobj._build_fft_beam()
 
-        self._beam_kernel = self._build_beam_kernel()
+        self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
 
     # -----------------------------------------------------------------------------
-    # - Beam convolution (pure Python, matching BBarolo's setCfield)
+    # - Model smoothing
     # -----------------------------------------------------------------------------
-    def _build_beam_kernel(self):
-        """Build 2D Gaussian beam kernel matching BBarolo's cfield construction."""
-        hdr = pyfits.getheader(self.bbobj.inp.fname)
-
-        bmaj = hdr["BMAJ"] * 3600  # degrees -> arcsec
-        bmin = hdr["BMIN"] * 3600  # degrees -> arcsec
-        bpa = hdr.get("BPA", 0)  # degrees
-
-        pixsizeX = abs(hdr["CDELT1"]) * 3600  # degrees -> arcsec
-        pixsizeY = abs(hdr["CDELT2"]) * 3600  # degrees -> arcsec
-
-        # BBarolo convention: convolving from point beam (0,0,0) to target beam
-        # gives Con = {bmaj, bmin, bpa-90}
-        phi = np.radians(bpa - 90.0)
-        cs, sn = np.cos(phi), np.sin(phi)
-
-        # Kernel extent (same factor as BBarolo: sqrt(-log(1e-4)/log(2)))
-        extend = np.sqrt(-np.log(1e-4) / np.log(2.0))
-        xr_ext = 0.5 * bmaj * extend
-        yr_ext = 0.5 * bmin * extend
-
-        x_max = max(abs(xr_ext * cs), abs(yr_ext * sn))
-        y_max = max(abs(xr_ext * sn), abs(yr_ext * cs))
-
-        Xmax = round(x_max / pixsizeX)
-        Ymax = round(y_max / pixsizeY)
-
-        # Build kernel on pixel grid
-        ii, jj = np.meshgrid(np.arange(-Xmax, Xmax + 1), np.arange(-Ymax, Ymax + 1))
-
-        x = ii * pixsizeX  # pixel -> arcsec
-        y = jj * pixsizeY
-
-        xr = x * cs + y * sn
-        yr = -x * sn + y * cs
-
-        argfac = -4.0 * np.log(2.0)
-        argX = (xr / bmaj) if bmaj != 0 else np.zeros_like(xr)
-        argY = (yr / bmin) if bmin != 0 else np.zeros_like(yr)
-        kernel = np.exp(argfac * (argX**2 + argY**2))
-        kernel[kernel < 1e-4] = 0
-        return kernel / kernel.sum()
-
     def _smooth_model(self, model):
         """Convolve each channel with the beam kernel (pure Python)."""
-        # smoothed = np.zeros_like(model, dtype=np.float64)
-        smoothed = fftconvolve(
-            model, self._beam_kernel[None, :, :], mode="same", axes=(-2, -1)
-        )
-        # for z in range(model.shape[0]):
-        # #   sm_ = np.fft.rfft2(model[z]) * self._beam_kernel
-        # #   smoothed[z] = np.fft.irfft2(sm_)
-        #     smoothed[z] = fftconvolve(model[z], self._beam_kernel, mode='same')
-        smoothed[np.abs(smoothed) < 1e-12] = 0
-        return smoothed
+        model[np.isnan(model)] = 0.00
+        
+        if self.bbobj._beam_kernel_fft is not None:
+            _, ny, nx = model.shape
+            ky, kx = self.bbobj._beam_kernel.shape[-2], self.bbobj._beam_kernel.shape[-1]
+            model_fft = np.fft.rfft2(model, s=self.bbobj._beam_fft_shape, axes=(-2, -1))
+            conv = np.fft.irfft2(
+                model_fft * self.bbobj._beam_kernel_fft,
+                s=self.bbobj._beam_fft_shape,
+                axes=(-2, -1),
+            )
+            y0 = (ky - 1) // 2
+            x0 = (kx - 1) // 2
+            model = conv[:, y0 : y0 + ny, x0 : x0 + nx]
+        return model
 
     # -----------------------------------------------------------------------------
     # - Model normalization
@@ -255,7 +402,7 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
-    def _get_model(self, theta):
+    def _get_model(self, theta, convolve=False):
         for k in self.freepar_idx:
             if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
@@ -263,9 +410,7 @@ class Sampler:
         rings = self.bbobj._update_rings(self.bbobj._inri, theta)
 
         if self.bbobj.update_prof:
-            rings.r["radii"] = rings.r["radii"].copy() + 0.50 * self.bbobj.rsep
             self.bbobj._update_profile(rings)
-            rings.r["radii"] = rings.r["radii"].copy() - 0.50 * self.bbobj.rsep
 
         # Calculate the model and the boundaries
         model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
@@ -290,9 +435,8 @@ class Sampler:
         model = np.zeros(data.shape)
         model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
 
-        # Convolve with the beam after normalization (pure Python to avoid
-        # C++ Smooth3D heap operations that corrupt malloc in forked processes)
-        model = self._smooth_model(model)
+        if convolve:
+            model = self._smooth_model(model)
 
         libBB.Galmod_delete(galmod)
 
@@ -302,18 +446,11 @@ class Sampler:
     # - Main method to run the sampler
     # -----------------------------------------------------------------------------
     def run(
-        self, method="nautilus", checkpoint=False, resume=False, threads=1, **kwargs
+        self, method="nautilus", checkpoint=False, resume=False, threads=1, likelihood_kwargs={}, **kwargs
     ):
-        if self.rms is None:
-            print(
-                "Calculating RMS from data. If you want to set it manually, "
-                "assign a value to 'self.rms' before running the sampler."
-            )
-
-            self.rms = scipy.stats.median_abs_deviation(
-                self.bbobj.data, scale="normal", axis=(-2, -1), nan_policy="omit"
-            )
-            self.rms = np.median(self.rms)
+        for key, value in self._likelihood._build(self.bbobj.data, **likelihood_kwargs).items():
+            setattr(self, key, value)
+        self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
 
         global _active_sampler
         _active_sampler = self
@@ -440,14 +577,12 @@ class Sampler:
             )
             return
 
-        model, _, _ = self._get_model(self.params)
+        model, _, _ = self._get_model(self.params, convolve=True)
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
 
         if self.bbobj.update_prof:
-            rings.r["radii"] = rings.r["radii"].copy() + 0.50 * self.bbobj.rsep
             self.bbobj._update_profile(rings)
-            rings.r["radii"] = rings.r["radii"].copy() - 0.50 * self.bbobj.rsep
 
         libBB.Galfit_setOutRings(self.bbobj._galfit, rings._rings)
 
