@@ -55,7 +55,7 @@ class Init(BayesianBBarolo):
             if isinstance(beam, str):
                 self.add_beam_from_fits(beam, normalize=normalize_beam)
             elif isinstance(beam, bool) and beam:
-                normalize = 'sum' if normalize_beam is None else normalize_beam
+                normalize = "sum" if normalize_beam is None else normalize_beam
                 self.build_beam_from_header(normalize=normalize)
             else:
                 raise ValueError("Invalid value for 'beam' argument.")
@@ -219,16 +219,23 @@ class Init(BayesianBBarolo):
 
 
     def _normalize_kernel(self, normalize="sum"):
-        if normalize == "sum":
-            if self._beam_kernel.ndim == 2:
-                self._beam_kernel /= self._beam_kernel.sum()
-            else:
-                self._beam_kernel /= self._beam_kernel.sum(axis=(-2, -1), keepdims=True)
-        elif normalize == "peak":
-            if self._beam_kernel.ndim == 2:
-                self._beam_kernel /= self._beam_kernel.max()
-            else:
-                self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
+        if isinstance(normalize, bool):
+            normalize = "sum" if normalize else None
+
+        if (
+            normalize is not None 
+            and isinstance(normalize, str)
+        ):
+            if normalize == "sum":
+                if self._beam_kernel.ndim == 2:
+                    self._beam_kernel /= self._beam_kernel.sum()
+                else:
+                    self._beam_kernel /= self._beam_kernel.sum(axis=(-2, -1), keepdims=True)
+            elif normalize == "peak":
+                if self._beam_kernel.ndim == 2:
+                    self._beam_kernel /= self._beam_kernel.max()
+                else:
+                    self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
 
 
     def _build_fft_beam(self):
