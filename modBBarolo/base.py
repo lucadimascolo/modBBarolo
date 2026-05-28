@@ -361,8 +361,7 @@ class Sampler:
                 s=self.bbobj._beam_fft_shape,
                 axes=(-2, -1),
             )
-            y0 = (ky - 1) // 2
-            x0 = (kx - 1) // 2
+            y0, x0 = np.unravel_index(self.bbobj._beam_kernel.argmax(), self.bbobj._beam_kernel.shape)[-2:]
             model = conv[:, y0 : y0 + ny, x0 : x0 + nx]
         return model
 
