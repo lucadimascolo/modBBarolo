@@ -476,7 +476,7 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
-    def _get_model(self, theta, convolve=False):
+    def _get_model(self, theta, convolve=False, normalize=True):
         for k in self.freepar_idx:
             if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
@@ -516,6 +516,9 @@ class Sampler:
 
         model = np.zeros(data.shape)
         model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
+
+        if normalize and self.method_norm in ["constant", "exponential"]:
+            model = self._normalize_model(model, data, **kwargs)
 
         if convolve:
             model = self._smooth_model(model)
@@ -747,7 +750,7 @@ class Sampler:
             )
             return
 
-        model, _, _ = self._get_model(self.params, convolve=True)
+        model, _, _ = self._get_model(self.params, convolve=True, normalize=True)
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
 
