@@ -517,11 +517,21 @@ class Sampler:
         model = np.zeros(data.shape)
         model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
 
-        if normalize and self.method_norm in ["constant", "exponential"]:
-            model = self._normalize_model(model, data, **kwargs)
+        if (
+            normalize and
+            (
+                self.method_norm in ["constant", "exponential"] or
+                (self.method_norm == "local" and self.moment_zero_ref is not None)
+            )
+        ):
+            model_ = self._normalize_model(model_, data_, mask_, **kwargs)
 
         if convolve:
+            model = np.zeros(data.shape)
+            model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
             model = self._smooth_model(model)
+            model_ = model[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
+            del model
 
         if self.method_norm == "flux" or \
           (self.method_norm == "local" and self.moment_zero is None):
