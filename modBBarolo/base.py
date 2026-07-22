@@ -296,6 +296,16 @@ class Sampler:
         self.method_norm = method_norm
 
 
+        if method_norm not in _norms:
+            raise ValueError(f"Method {method_norm} not recognized. Please use one of: {_norms}")
+        
+        self.method_norm = method_norm
+
+
+        if method_norm not in _norms:
+            raise ValueError(f"Method {method_norm} not recognized.\nPlease use one of {_norms}")
+        self.method_norm = method_norm
+
         self.bbobj._opts.add_params(sm=False)
 
         self.bbobj._setup(self.free_params, useBBres=False)
