@@ -35,6 +35,7 @@ is_positive = (
 
 _active_sampler = None
 
+_norms = ["flux", "local", "constant", "exponential"]
 
 # -----------------------------------------------------------------------------
 # Initialize BBarolo
@@ -271,15 +272,21 @@ class Sampler:
         free_params,
         likelihood=Normal,
         method_norm="constant",
-        output=None
+        output=None,
+        moment_zero=None,
     ):
         self.bbobj = bbobj
         self.free_params = free_params
-        self.method_norm = method_norm
-        self.output = output
 
+        self.output = output
         if self.output is None:
             self.output = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if method_norm not in _norms:
+            raise ValueError(f"Method {method_norm} not recognized. Please use one of: {_norms}")
+        
+        self.method_norm = method_norm
+
 
         self.bbobj._opts.add_params(sm=False)
 
@@ -293,6 +300,10 @@ class Sampler:
 
         if self.bbobj.mask is None:
             self.bbobj.mask = np.ones_like(self.bbobj.data, dtype=bool)
+
+        self.moment_zero = moment_zero
+    #   self.moment_zero_data = np.nansum(self.bbobj.data, axis=0)
+        self.moment_zero_data = np.nansum(self.bbobj.data * self.bbobj.mask, axis=0)
 
         if not self.bbobj.useNorm:
             raise ValueError(
@@ -354,7 +365,6 @@ class Sampler:
         
         if self.bbobj._beam_kernel_fft is not None:
             _, ny, nx = model.shape
-            ky, kx = self.bbobj._beam_kernel.shape[-2], self.bbobj._beam_kernel.shape[-1]
             model_fft = np.fft.rfft2(model, s=self.bbobj._beam_fft_shape, axes=(-2, -1))
             conv = np.fft.irfft2(
                 model_fft * self.bbobj._beam_kernel_fft,
@@ -368,11 +378,13 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Model normalization
     # -----------------------------------------------------------------------------
-    def _normalize_model(self, model, data, **kwargs):
-        if self.method_norm == "model":
-            return model * np.nansum(data) / np.nansum(model)
+    def _normalize_model(self, model, data, mask, **kwargs):
+        if self.method_norm == "flux":
+            return model * np.nansum(data * mask) / np.nansum(model * mask)
+        elif self.method_norm == "local":
+            return model * kwargs["moment_zero"] / np.nansum(model * mask, axis=0)
         elif self.method_norm == "constant":
-            return kwargs["norm"] * model
+            return kwargs["norm"] * model * mask
         elif self.method_norm == "exponential":
             norm = kwargs["norm"]
             rdisk = kwargs["rdisk"]
@@ -392,7 +404,7 @@ class Sampler:
             yr = (-(xx - x0) * np.cos(phi) - (yy - y0) * np.sin(phi)) / np.cos(inc)
             R = np.sqrt(xr**2 + yr**2) * self.pixscale
 
-            return model * norm * np.exp(-R / rdisk)
+            return model * mask * norm * np.exp(-R / rdisk)
 
     # -----------------------------------------------------------------------------
     # - Prior Transform for nested sampler
@@ -421,10 +433,11 @@ class Sampler:
         # Calculate the model and the boundaries
         model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
 
-        # Calculate the residuals
+        # Extract mask and data arrays
         mask = self.bbobj.mask.copy()
         data = self.bbobj.data.copy()
 
+        mask_ = mask[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
         data_ = data[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
 
         kwargs = {}
@@ -435,14 +448,25 @@ class Sampler:
             kwargs["rdisk"] = theta[self.freepar_idx["rdisk"]]
             kwargs["rings"] = rings
             kwargs["bhi"], kwargs["blo"] = bhi, blo
-
-        model_ = self._normalize_model(model_, data_, **kwargs)
+        elif self.method_norm == "local":
+            if self.moment_zero is None:
+                kwargs["moment_zero"] = self.moment_zero_data.copy()
+            else:
+                kwargs["moment_zero"] = self.moment_zero[blo[1] : bhi[1], blo[0] : bhi[0]]
+            
+        if self.method_norm in ["constant", "exponential"] or \
+          (self.method_norm == "local" and self.moment_zero is not None):
+            model_ = self._normalize_model(model_, data_, mask_, **kwargs)
 
         model = np.zeros(data.shape)
         model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
 
         if convolve:
             model = self._smooth_model(model)
+
+        if self.method_norm == "flux" or \
+          (self.method_norm == "local" and self.moment_zero is None):
+            model = self._normalize_model(model, data, mask, **kwargs)
 
         libBB.Galmod_delete(galmod)
 
@@ -573,6 +597,28 @@ class Sampler:
         plt.savefig(f"{self.output}_corner.pdf", format="pdf", dpi=300)
         plt.close()
 
+    # -----------------------------------------------------------------------------
+    # - Save 16-50-84 percentiles for each free parameter
+    # -----------------------------------------------------------------------------
+    def save_percentiles(self):
+        edges = np.array(
+            [
+                corner.quantile(s, [0.16, 0.50, 0.84], weights=self.weights)
+                for s in self.samples.T
+            ]
+        )
+
+        header = f"{'param':<20} {'p16':>15} {'p50':>15} {'p84':>15}"
+        rows = [
+            f"{name:<20} {p16:>15.6e} {p50:>15.6e} {p84:>15.6e}"
+            for name, (p16, p50, p84) in zip(self.freepar_names, edges)
+        ]
+
+        with open(f"{self.output}_percentiles.txt", "w") as f:
+            f.write("\n".join([header] + rows) + "\n")
+
+        return edges
+    
     # -----------------------------------------------------------------------------
     # - Save best-fit model and outputs using the best-fit parameters
     # -----------------------------------------------------------------------------
