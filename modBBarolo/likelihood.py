@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import scipy.stats
 
@@ -41,7 +43,9 @@ class Normal:
         log_norm = np.log(2.00 * np.pi * self.rms**2)
         log_norm = -0.50 * np.nansum(log_norm * data.shape[1] * data.shape[2])
 
-        return log_like + log_norm
+        regularization = self._regularize_vdisp(theta, alpha=1.00)
+        
+        return log_like + log_norm + regularization
 
 
 # -----------------------------------------------------------------------------
@@ -84,4 +88,6 @@ class NormalRI:
 
         log_norm = 0.00
 
-        return log_like + log_norm
+        regularization = self._regularize_vdisp(theta, alpha=1.00)
+        
+        return log_like + log_norm + regularization

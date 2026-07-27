@@ -274,6 +274,7 @@ class Sampler:
         method_norm="constant",
         output=None,
         moment_zero=None,
+        regularize={"vdisp": 0.00}
     ):
         self.bbobj = bbobj
         self.free_params = free_params
@@ -356,6 +357,11 @@ class Sampler:
 
         self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
 
+        for key in regularize.keys():
+            if key not in ["vdisp"]:
+                raise ValueError(f"Regularization key '{key}' is not recognized.")
+        self._regularize = regularize.copy()
+
     # -----------------------------------------------------------------------------
     # - Model smoothing
     # -----------------------------------------------------------------------------
@@ -416,6 +422,15 @@ class Sampler:
                 u[self.freepar_idx[key]]
             )
         return p
+
+    # -----------------------------------------------------------------------------
+    # - Regularization term for velocity dispersion
+    # -----------------------------------------------------------------------------
+    def _regularize_vdisp(self, theta, alpha=1.00):
+        if self._regularize["vdisp"] == 0.00 and ("vdisp" not in self.freepar_idx):
+            return 0.00
+        vdisp = theta[self.freepar_idx["vdisp"]]
+        return -self._regularize["vdisp"] * np.mean(np.abs(np.diff(vdisp)) ** alpha)
 
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
