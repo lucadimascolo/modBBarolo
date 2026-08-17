@@ -41,11 +41,6 @@ _norms = ["flux", "local", "constant", "exponential"]
 _methods = ["nautilus", "emcee"]
 
 
-def _pad_size(image_shape, kernel_shape):
-    """Full-linear-convolution padded shape per axis: image + kernel - 1."""
-    return tuple(int(i + k - 1) for i, k in zip(image_shape, kernel_shape))
-
-
 # -----------------------------------------------------------------------------
 # Initialize BBarolo
 # -----------------------------------------------------------------------------
@@ -272,17 +267,13 @@ class Init(BayesianBBarolo):
         image_shape = (ny, nx)
         kernel_shape = self._beam_kernel.shape[-2:]
 
-        self._beam_fft_shape = _pad_size(image_shape, kernel_shape)
+        self._beam_fft_shape = tuple(int(i + k - 1) for i, k in zip(image_shape, kernel_shape))
 
-        # Use the kernel as-is (no forced symmetrization): a real "dirty" PSF
-        # has genuinely asymmetric sidelobes that NormalRI needs preserved.
         self._beam_kernel_fft = np.fft.rfft2(
             self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
         )
 
-        # Crop-back offset = the kernel's own peak location, computed
-        # per-channel for a 3D (nchans, ky, kx) kernel so each channel is
-        # cropped using its own peak rather than a single global argmax.
+        # Crop-back offset and padding
         if self._beam_kernel.ndim == 2:
             self._beam_crop_start = np.unravel_index(
                 np.argmax(self._beam_kernel), kernel_shape
@@ -330,10 +321,7 @@ class Sampler:
         self.method_norm = method_norm
 
         # Opt-in: if the user set priors["vdisp"]["name"] == "sqrt", vdisp is
-        # sampled uniform in vdisp^2 over the given [loc, loc+scale] bounds
-        # (see _prior_transform/_log_prior) instead of the plain named prior.
-        # Pre-build the underlying (unmodified) "uniform" distribution here so
-        # bbobj._setup() below doesn't try (and fail) to build a "sqrt" one.
+        # sampled uniform in vdisp^2 over the given [loc, loc+scale] bounds.
         self._vdisp_sqrt = (
             any(p.split("_")[0] == "vdisp" for p in free_params)
             and self.bbobj.priors["vdisp"]["name"] == "sqrt"
@@ -353,7 +341,7 @@ class Sampler:
         self.bbobj.update_prof = any(
             sub in string
             for string in self.bbobj.freepar_names
-            for sub in ["inc", "phi", "xpos", "ypos"]
+            for sub in ["inc", "phi", "xpos", "ypos", "radmax"]
         )
 
         if self.bbobj.mask is None:
@@ -452,7 +440,10 @@ class Sampler:
             return model * np.nansum(data * mask) / np.nansum(model * mask)
         elif self.method_norm == "local":
             model_ = np.nansum(model * mask, axis=0)
-            return np.where(model_==0, model * kwargs["moment_zero"] / model_, 0.00)
+            ratio = np.divide(
+                kwargs["moment_zero"], model_, out=np.zeros_like(model_), where=model_ != 0
+            )
+            return model * ratio
         elif self.method_norm == "constant":
             return kwargs["norm"] * model * mask
         elif self.method_norm == "exponential":
@@ -552,11 +543,11 @@ class Sampler:
         model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
 
         # Extract mask and data arrays
-        mask = self.bbobj.mask.copy()
-        data = self.bbobj.data.copy()
+        mask = self.bbobj.mask
+        data = self.bbobj.data
 
-        mask_ = mask[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
-        data_ = data[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
+        mask_ = mask[:, blo[1] : bhi[1], blo[0] : bhi[0]]
+        data_ = data[:, blo[1] : bhi[1], blo[0] : bhi[0]]
 
         kwargs = {}
         if self.method_norm == "constant":
