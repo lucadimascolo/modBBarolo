@@ -320,7 +320,7 @@ class Sampler:
         
         self.method_norm = method_norm
 
-        # Opt-in: if the user set priors["vdisp"]["name"] == "sqrt", vdisp is
+        # If the user set priors["vdisp"]["name"] == "sqrt", vdisp is
         # sampled uniform in vdisp^2 over the given [loc, loc+scale] bounds.
         self._vdisp_sqrt = (
             any(p.split("_")[0] == "vdisp" for p in free_params)
@@ -348,7 +348,6 @@ class Sampler:
             self.bbobj.mask = np.ones_like(self.bbobj.data, dtype=bool)
 
         self.moment_zero = moment_zero
-    #   self.moment_zero_data = np.nansum(self.bbobj.data, axis=0)
         self.moment_zero_data = np.nansum(self.bbobj.data * self.bbobj.mask, axis=0)
 
         if not self.bbobj.useNorm:
@@ -465,7 +464,7 @@ class Sampler:
             yr = (-(xx - x0) * np.cos(phi) - (yy - y0) * np.sin(phi)) / np.cos(inc)
             R = np.sqrt(xr**2 + yr**2) * self.pixscale
 
-            return model * mask * norm * np.exp(-R / rdisk)
+            return model * mask * norm * np.exp(-R[None, :, :] / rdisk)
 
     # -----------------------------------------------------------------------------
     # - Prior Transform for nested sampler
