@@ -40,6 +40,12 @@ _norms = ["flux", "local", "constant", "exponential"]
 
 _methods = ["nautilus", "emcee"]
 
+
+def _pad_size(image_shape, kernel_shape):
+    """Full-linear-convolution padded shape per axis: image + kernel - 1."""
+    return tuple(int(i + k - 1) for i, k in zip(image_shape, kernel_shape))
+
+
 # -----------------------------------------------------------------------------
 # Initialize BBarolo
 # -----------------------------------------------------------------------------
@@ -50,6 +56,7 @@ class Init(BayesianBBarolo):
         self._beam_kernel = None
         self._beam_kernel_fft = None
         self._beam_fft_shape = None
+        self._beam_crop_start = None
 
         self._add_zero = False
         self._vrot_r0_removed_idx = None
@@ -242,17 +249,46 @@ class Init(BayesianBBarolo):
                     self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
 
 
+    def _center_kernel(self, kernel):
+        """Magnitude-symmetrize and re-center a kernel so its peak sits at
+        array index [0, 0] (the corner-origin convention FFT convolution
+        needs). Does not mutate the input; returns a new array. Operates
+        over axes=(-2, -1) so it works for both a 2D (ky, kx) kernel and a
+        3D (nchans, ky, kx) per-channel kernel.
+        """
+        kshape = kernel.shape[-2:]
+        magnitude = np.abs(np.fft.rfft2(kernel, axes=(-2, -1)))
+        kernel = np.fft.irfft2(magnitude, s=kshape, axes=(-2, -1))
+        return np.fft.ifftshift(kernel, axes=(-2, -1))
+
+
     def _build_fft_beam(self):
         _, ny, nx = self.data.shape
-        ky, kx = self._beam_kernel.shape[-2], self._beam_kernel.shape[-1]
+        image_shape = (ny, nx)
+        kernel_shape = self._beam_kernel.shape[-2:]
 
-        fshape_y = ny + ky - 1
-        fshape_x = nx + kx - 1
+        self._beam_fft_shape = _pad_size(image_shape, kernel_shape)
 
-        self._beam_fft_shape = (fshape_y, fshape_x)
+        centered_kernel = self._center_kernel(self._beam_kernel)
+
+        fft_shift = 1.00 + 0j
+        if image_shape[0] % 2 != 0:
+            freq_y = np.fft.fftfreq(self._beam_fft_shape[0])[:, None]
+            fft_shift = fft_shift * np.exp(2.00j * np.pi * freq_y)
+        if image_shape[1] % 2 != 0:
+            freq_x = np.fft.rfftfreq(self._beam_fft_shape[1])[None, :]
+            fft_shift = fft_shift * np.exp(2.00j * np.pi * freq_x)
+
         self._beam_kernel_fft = np.fft.rfft2(
-            self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
-        )
+            centered_kernel, s=self._beam_fft_shape, axes=(-2, -1)
+        ) * fft_shift
+
+        start = [(p - i) // 2 for p, i in zip(self._beam_fft_shape, image_shape)]
+        if image_shape[0] % 2 == 0:
+            start[0] += 1
+        if image_shape[1] % 2 == 0:
+            start[1] += 1
+        self._beam_crop_start = tuple(start)
 
 
 # -----------------------------------------------------------------------------
@@ -397,7 +433,7 @@ class Sampler:
                 s=self.bbobj._beam_fft_shape,
                 axes=(-2, -1),
             )
-            y0, x0 = np.unravel_index(self.bbobj._beam_kernel.argmax(), self.bbobj._beam_kernel.shape)[-2:]
+            y0, x0 = self.bbobj._beam_crop_start
             model = conv[:, y0 : y0 + ny, x0 : x0 + nx]
         return model
 
