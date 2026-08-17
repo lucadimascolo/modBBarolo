@@ -433,7 +433,8 @@ class Sampler:
         if self.method_norm == "flux":
             return model * np.nansum(data * mask) / np.nansum(model * mask)
         elif self.method_norm == "local":
-            return model * kwargs["moment_zero"] / np.nansum(model * mask, axis=0)
+            model_ = np.nansum(model * mask, axis=0)
+            return np.where(model_==0, model * kwargs["moment_zero"] / model_, 0.00)
         elif self.method_norm == "constant":
             return kwargs["norm"] * model * mask
         elif self.method_norm == "exponential":
