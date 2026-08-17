@@ -292,6 +292,23 @@ class Sampler:
         
         self.method_norm = method_norm
 
+        # Opt-in: if the user set priors["vdisp"]["name"] == "sqrt", vdisp is
+        # sampled uniform in vdisp^2 over the given [loc, loc+scale] bounds
+        # (see _prior_transform/_log_prior) instead of the plain named prior.
+        # Pre-build the underlying (unmodified) "uniform" distribution here so
+        # bbobj._setup() below doesn't try (and fail) to build a "sqrt" one.
+        self._vdisp_sqrt = (
+            any(p.split("_")[0] == "vdisp" for p in free_params)
+            and self.bbobj.priors["vdisp"]["name"] == "sqrt"
+        )
+        if self._vdisp_sqrt:
+            distr_kw = {
+                key: value
+                for key, value in self.bbobj.priors["vdisp"].items()
+                if key != "name"
+            }
+            self.bbobj.prior_distr["vdisp"] = get_distribution("uniform", **distr_kw)
+
         self.bbobj._opts.add_params(sm=False)
 
         self.bbobj._setup(self.free_params, useBBres=False)
@@ -424,6 +441,12 @@ class Sampler:
             p[self.freepar_idx[key]] = self.prior_distr[key].ppf(
                 u[self.freepar_idx[key]]
             )
+        if self._vdisp_sqrt:
+            # Bounds [a, b] are given directly in vdisp units; sample so that
+            # vdisp is uniform in vdisp^2 (density ~ vdisp) over [a, b].
+            idx = self.freepar_idx["vdisp"]
+            a, b = self.prior_distr["vdisp"].support()
+            p[idx] = np.sqrt(a**2 + u[idx] * (b**2 - a**2))
         return p
 
     # -----------------------------------------------------------------------------
@@ -432,7 +455,16 @@ class Sampler:
     def _log_prior(self, theta):
         lp = 0.00
         for key, idx in self.freepar_idx.items():
-            logpdf = self.prior_distr[key].logpdf(theta[idx])
+            value = theta[idx]
+            if key == "vdisp" and self._vdisp_sqrt:
+                # Matches _prior_transform: vdisp uniform in vdisp^2 over [a, b]
+                # (bounds given directly in vdisp units) -> pdf(y) = 2y/(b^2-a^2).
+                a, b = self.prior_distr["vdisp"].support()
+                if np.any(value < a) or np.any(value > b):
+                    return -np.inf
+                logpdf = np.log(2.00 * value) - np.log(b**2 - a**2)
+            else:
+                logpdf = self.prior_distr[key].logpdf(value)
             if np.any(~np.isfinite(logpdf)):
                 return -np.inf
             lp += np.sum(logpdf)
