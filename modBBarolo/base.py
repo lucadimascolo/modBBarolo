@@ -249,19 +249,6 @@ class Init(BayesianBBarolo):
                     self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
 
 
-    def _center_kernel(self, kernel):
-        """Magnitude-symmetrize and re-center a kernel so its peak sits at
-        array index [0, 0] (the corner-origin convention FFT convolution
-        needs). Does not mutate the input; returns a new array. Operates
-        over axes=(-2, -1) so it works for both a 2D (ky, kx) kernel and a
-        3D (nchans, ky, kx) per-channel kernel.
-        """
-        kshape = kernel.shape[-2:]
-        magnitude = np.abs(np.fft.rfft2(kernel, axes=(-2, -1)))
-        kernel = np.fft.irfft2(magnitude, s=kshape, axes=(-2, -1))
-        return np.fft.ifftshift(kernel, axes=(-2, -1))
-
-
     def _build_fft_beam(self):
         _, ny, nx = self.data.shape
         image_shape = (ny, nx)
@@ -269,26 +256,22 @@ class Init(BayesianBBarolo):
 
         self._beam_fft_shape = _pad_size(image_shape, kernel_shape)
 
-        centered_kernel = self._center_kernel(self._beam_kernel)
-
-        fft_shift = 1.00 + 0j
-        if image_shape[0] % 2 != 0:
-            freq_y = np.fft.fftfreq(self._beam_fft_shape[0])[:, None]
-            fft_shift = fft_shift * np.exp(2.00j * np.pi * freq_y)
-        if image_shape[1] % 2 != 0:
-            freq_x = np.fft.rfftfreq(self._beam_fft_shape[1])[None, :]
-            fft_shift = fft_shift * np.exp(2.00j * np.pi * freq_x)
-
+        # Use the kernel as-is (no forced symmetrization): a real "dirty" PSF
+        # has genuinely asymmetric sidelobes that NormalRI needs preserved.
         self._beam_kernel_fft = np.fft.rfft2(
-            centered_kernel, s=self._beam_fft_shape, axes=(-2, -1)
-        ) * fft_shift
+            self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
+        )
 
-        start = [(p - i) // 2 for p, i in zip(self._beam_fft_shape, image_shape)]
-        if image_shape[0] % 2 == 0:
-            start[0] += 1
-        if image_shape[1] % 2 == 0:
-            start[1] += 1
-        self._beam_crop_start = tuple(start)
+        # Crop-back offset = the kernel's own peak location, computed
+        # per-channel for a 3D (nchans, ky, kx) kernel so each channel is
+        # cropped using its own peak rather than a single global argmax.
+        if self._beam_kernel.ndim == 2:
+            self._beam_crop_start = np.unravel_index(
+                np.argmax(self._beam_kernel), kernel_shape
+            )
+        else:
+            flat_idx = self._beam_kernel.reshape(self._beam_kernel.shape[0], -1).argmax(axis=1)
+            self._beam_crop_start = np.unravel_index(flat_idx, kernel_shape)
 
 
 # -----------------------------------------------------------------------------
@@ -434,7 +417,13 @@ class Sampler:
                 axes=(-2, -1),
             )
             y0, x0 = self.bbobj._beam_crop_start
-            model = conv[:, y0 : y0 + ny, x0 : x0 + nx]
+            if np.ndim(y0) == 0:
+                model = conv[:, y0 : y0 + ny, x0 : x0 + nx]
+            else:
+                model = np.stack([
+                    conv[c, y0[c] : y0[c] + ny, x0[c] : x0[c] + nx]
+                    for c in range(conv.shape[0])
+                ])
         return model
 
     # -----------------------------------------------------------------------------
