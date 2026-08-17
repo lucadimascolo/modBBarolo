@@ -261,14 +261,11 @@ class Init(BayesianBBarolo):
 def _mp_log_likelihood(theta):
     return _active_sampler._log_likelihood(theta)
 
-
 def _mp_prior_transform(u):
     return _active_sampler._prior_transform(u)
 
-
-def _mp_log_probability(theta):
-    return _active_sampler._log_probability(theta)
-
+def _mp_log_posterior(theta):
+    return _active_sampler._log_posterior(theta)
 
 # -----------------------------------------------------------------------------
 # Sampler class
@@ -293,17 +290,6 @@ class Sampler:
         if method_norm not in _norms:
             raise ValueError(f"Method {method_norm} not recognized. Please use one of: {_norms}")
         
-        self.method_norm = method_norm
-
-
-        if method_norm not in _norms:
-            raise ValueError(f"Method {method_norm} not recognized. Please use one of: {_norms}")
-        
-        self.method_norm = method_norm
-
-
-        if method_norm not in _norms:
-            raise ValueError(f"Method {method_norm} not recognized.\nPlease use one of {_norms}")
         self.method_norm = method_norm
 
         self.bbobj._opts.add_params(sm=False)
@@ -455,7 +441,7 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Log-probability (prior + likelihood) for ensemble sampler (emcee)
     # -----------------------------------------------------------------------------
-    def _log_probability(self, theta):
+    def _log_posterior(self, theta):
         lp = self._log_prior(theta)
         if not np.isfinite(lp):
             return -np.inf
@@ -476,7 +462,7 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
-    def _get_model(self, theta, convolve=False, normalize=True):
+    def _get_model(self, theta, convolve=False):
         for k in self.freepar_idx:
             if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
@@ -517,21 +503,8 @@ class Sampler:
         model = np.zeros(data.shape)
         model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
 
-        if (
-            normalize and
-            (
-                self.method_norm in ["constant", "exponential"] or
-                (self.method_norm == "local" and self.moment_zero_ref is not None)
-            )
-        ):
-            model_ = self._normalize_model(model_, data_, mask_, **kwargs)
-
         if convolve:
-            model = np.zeros(data.shape)
-            model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
             model = self._smooth_model(model)
-            model_ = model[:, blo[1] : bhi[1], blo[0] : bhi[0]].copy()
-            del model
 
         if self.method_norm == "flux" or \
           (self.method_norm == "local" and self.moment_zero is None):
@@ -547,6 +520,7 @@ class Sampler:
     def run(
         self, method="nautilus", checkpoint=False, resume=False, threads=1, likelihood_kwargs={}, **kwargs
     ):
+
         if method not in _methods:
             raise ValueError(f"Method {method} not recognized. Please use one of: {_methods}")
 
@@ -645,7 +619,7 @@ class Sampler:
                 backend = None
 
             self.sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, _mp_log_probability, pool=pool, backend=backend, **sampler_kwargs
+                nwalkers, ndim, _mp_log_posterior, pool=pool, backend=backend, **sampler_kwargs
             )
 
             # 'nsteps' is a total iteration target, not an increment: resuming
@@ -760,7 +734,7 @@ class Sampler:
             )
             return
 
-        model, _, _ = self._get_model(self.params, convolve=True, normalize=True)
+        model, _, _ = self._get_model(self.params, convolve=True)
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
 
