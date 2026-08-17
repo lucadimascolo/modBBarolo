@@ -5,6 +5,7 @@ from pyBBarolo.bayesian import libBB, ctypes, reshapePointer
 from pyBBarolo.bayesian import BayesianBBarolo
 
 import nautilus
+import emcee
 import corner
 
 import inspect
@@ -36,6 +37,8 @@ is_positive = (
 _active_sampler = None
 
 _norms = ["flux", "local", "constant", "exponential"]
+
+_methods = ["nautilus", "emcee"]
 
 # -----------------------------------------------------------------------------
 # Initialize BBarolo
@@ -263,6 +266,10 @@ def _mp_prior_transform(u):
     return _active_sampler._prior_transform(u)
 
 
+def _mp_log_probability(theta):
+    return _active_sampler._log_probability(theta)
+
+
 # -----------------------------------------------------------------------------
 # Sampler class
 # -----------------------------------------------------------------------------
@@ -424,6 +431,30 @@ class Sampler:
         return p
 
     # -----------------------------------------------------------------------------
+    # - Log-prior for ensemble sampler (emcee)
+    # -----------------------------------------------------------------------------
+    def _log_prior(self, theta):
+        lp = 0.00
+        for key, idx in self.freepar_idx.items():
+            logpdf = self.prior_distr[key].logpdf(theta[idx])
+            if np.any(~np.isfinite(logpdf)):
+                return -np.inf
+            lp += np.sum(logpdf)
+        return lp
+
+    # -----------------------------------------------------------------------------
+    # - Log-probability (prior + likelihood) for ensemble sampler (emcee)
+    # -----------------------------------------------------------------------------
+    def _log_probability(self, theta):
+        lp = self._log_prior(theta)
+        if not np.isfinite(lp):
+            return -np.inf
+        ll = self._log_likelihood(theta)
+        if not np.isfinite(ll):
+            return -np.inf
+        return lp + ll
+
+    # -----------------------------------------------------------------------------
     # - Regularization term for velocity dispersion
     # -----------------------------------------------------------------------------
     def _regularize_vdisp(self, theta, alpha=1.00):
@@ -493,6 +524,9 @@ class Sampler:
     def run(
         self, method="nautilus", checkpoint=False, resume=False, threads=1, likelihood_kwargs={}, **kwargs
     ):
+        if method not in _methods:
+            raise ValueError(f"Method {method} not recognized. Please use one of: {_methods}")
+
         for key, value in self._likelihood._build(self.bbobj.data, **likelihood_kwargs).items():
             setattr(self, key, value)
         self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
@@ -500,36 +534,7 @@ class Sampler:
         global _active_sampler
         _active_sampler = self
 
-        nlive = 1000
-        for key in ["nlive", "n_live"]:
-            nlive = kwargs.pop(key, nlive)
-
-        discard_exploration = kwargs.pop("discard_exploration", True)
-
-        sampler_kwargs = {}
-        for key in inspect.signature(nautilus.Sampler).parameters.keys():
-            if key not in [
-                "loglikelihood",
-                "prior_transform",
-                "n_dim",
-                "n_live",
-                "filepath",
-                "resume",
-                "pool",
-            ]:
-                if key in kwargs:
-                    sampler_kwargs[key] = kwargs.pop(key)
-
-        run_kwargs = {}
-        for key in inspect.signature(nautilus.Sampler.run).parameters.keys():
-            if key not in ["verbose", "discard_exploration"]:
-                if key in kwargs:
-                    run_kwargs[key] = kwargs.pop(key)
-
-        if checkpoint:
-            filepath = f"{self.output}_checkpoint.h5"
-        else:
-            filepath = None
+        ndim = len(self.freepar_names)
 
         if threads > 1:
             pool = multiprocess.Pool(threads)
@@ -537,14 +542,43 @@ class Sampler:
             pool = None
 
         if method == "nautilus":
+            nlive = 1000
+            for key in ["nlive", "n_live"]:
+                nlive = kwargs.pop(key, nlive)
+
+            discard_exploration = kwargs.pop("discard_exploration", True)
+
+            sampler_kwargs = {}
+            for key in inspect.signature(nautilus.Sampler).parameters.keys():
+                if key not in [
+                    "loglikelihood",
+                    "prior_transform",
+                    "n_dim",
+                    "n_live",
+                    "filepath",
+                    "resume",
+                    "pool",
+                ]:
+                    if key in kwargs:
+                        sampler_kwargs[key] = kwargs.pop(key)
+
+            run_kwargs = {}
+            for key in inspect.signature(nautilus.Sampler.run).parameters.keys():
+                if key not in ["verbose", "discard_exploration"]:
+                    if key in kwargs:
+                        run_kwargs[key] = kwargs.pop(key)
+
+            filepath = f"{self.output}_checkpoint.h5" if checkpoint else None
+
             self.sampler = nautilus.Sampler(
                 prior=_mp_prior_transform,
                 likelihood=_mp_log_likelihood,
                 n_live=nlive,
-                n_dim=len(self.freepar_names),
+                n_dim=ndim,
                 filepath=filepath,
                 resume=resume,
                 pool=pool,
+                **sampler_kwargs,
             )
 
             self.sampler.run(
@@ -553,6 +587,65 @@ class Sampler:
 
             self.samples, weights, _ = self.sampler.posterior()
             self.weights = np.exp(weights - np.max(weights))
+
+        elif method == "emcee":
+            nwalkers = kwargs.pop("nwalkers", max(4 * ndim, 20))
+            nsteps = kwargs.pop("nsteps", 5000)
+            discard = kwargs.pop("discard", 0)
+            thin = kwargs.pop("thin", 1)
+
+            sampler_kwargs = {}
+            for key in inspect.signature(emcee.EnsembleSampler).parameters.keys():
+                if key not in [
+                    "nwalkers",
+                    "ndim",
+                    "log_prob_fn",
+                    "pool",
+                    "backend",
+                    "args",
+                    "kwargs",
+                ]:
+                    if key in kwargs:
+                        sampler_kwargs[key] = kwargs.pop(key)
+
+            run_kwargs = {}
+            for key in inspect.signature(emcee.EnsembleSampler.run_mcmc).parameters.keys():
+                if key not in ["initial_state", "nsteps", "progress"]:
+                    if key in kwargs:
+                        run_kwargs[key] = kwargs.pop(key)
+
+            if checkpoint:
+                backend = emcee.backends.HDFBackend(f"{self.output}_checkpoint_emcee.h5")
+                if not resume:
+                    backend.reset(nwalkers, ndim)
+            else:
+                backend = None
+
+            self.sampler = emcee.EnsembleSampler(
+                nwalkers, ndim, _mp_log_probability, pool=pool, backend=backend, **sampler_kwargs
+            )
+
+            # 'nsteps' is a total iteration target, not an increment: resuming
+            # only runs the remaining iterations needed to reach it.
+            completed = backend.iteration if backend is not None and backend.initialized else 0
+            remaining = max(nsteps - completed, 0)
+
+            if completed > 0:
+                initial_state = None
+            else:
+                initial_state = np.array(
+                    [self._prior_transform(np.random.uniform(size=ndim)) for _ in range(nwalkers)]
+                )
+
+            if remaining > 0:
+                self.sampler.run_mcmc(initial_state, remaining, progress=True, **run_kwargs)
+            else:
+                print(
+                    f"Already at {completed} iterations (nsteps={nsteps}); nothing to run."
+                )
+
+            self.samples = self.sampler.get_chain(discard=discard, thin=thin, flat=True)
+            self.weights = np.ones(len(self.samples))
 
         if pool is not None:
             pool.close()
