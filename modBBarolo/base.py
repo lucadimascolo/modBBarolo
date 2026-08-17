@@ -72,7 +72,9 @@ class Init(BayesianBBarolo):
                 raise ValueError("Invalid value for 'beam' argument.")
 
 
-    def initialize(self, rsep, rnum, init={}, set_options={}, add_zero=False):
+    def initialize(self, rsep, rnum, init={}, set_options={}, add_zero=False,
+                   cdens_boost=None):
+    
         self._add_zero = add_zero
 
         self.radii = np.linspace(
@@ -82,6 +84,22 @@ class Init(BayesianBBarolo):
 
         if add_zero:
             self.radii = np.concatenate([[0.0], self.radii])
+
+
+        init = dict(init)
+
+        if cdens_boost is not None:
+            nr = len(self.radii)
+            dens0 = init.get("dens", 1.00)
+            dens_arr = (np.array(dens0, dtype=float) if hasattr(dens0, "__len__")
+                        else np.full(nr, float(dens0)))
+            if isinstance(cdens_boost, dict):
+                for cdens_boost_idx in cdens_boost.keys():
+                    if cdens_boost[cdens_boost_idx] is not None:
+                        dens_arr[cdens_boost_idx] *= cdens_boost[cdens_boost_idx]
+            else:
+                raise ValueError("'cdens_boost'should be a dict.")
+            init["dens"] = dens_arr
 
         self.init(radii=self.radii, **init)
 
