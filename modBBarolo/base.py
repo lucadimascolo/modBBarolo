@@ -8,6 +8,7 @@ import nautilus
 import emcee
 import corner
 
+import hashlib
 import inspect
 import types
 from datetime import datetime
@@ -39,6 +40,12 @@ _active_sampler = None
 _norms = ["flux", "local", "constant", "exponential"]
 
 _methods = ["nautilus", "emcee"]
+
+
+def _hash_seed(x):
+    """Map a continuous nuisance-parameter draw to a decorrelated, positive int32 BBarolo seed."""
+    digest = hashlib.blake2b(np.float64(x).tobytes(), digest_size=4).digest()
+    return int.from_bytes(digest, "little", signed=False) % (2**31 - 1)
 
 
 # -----------------------------------------------------------------------------
@@ -137,6 +144,32 @@ class Init(BayesianBBarolo):
             return result
 
         return super()._update_rings(rings, theta)
+
+
+    # -------------------------------------------------------------------------
+    # - Calculate model, optionally overriding the cloud-generation RNG seed
+    # -------------------------------------------------------------------------
+    def _calculate_model(self, rings, iseed=None, fullcube=False):
+        _, ys, xs = self.data.shape
+        bhi, blo = (ctypes.c_int * 2)(xs, ys), (ctypes.c_int * 2)(0)
+
+        if not fullcube:
+            bhi, blo = (ctypes.c_int * 2)(0), (ctypes.c_int * 2)(0)
+            libBB.Galfit_getModelSize(self._galfit, rings._rings, bhi, blo)
+
+        if iseed is None:
+            galmod = libBB.Galfit_getModel(self._galfit, rings._rings, bhi, blo, True)
+        else:
+            galmod = libBB.Galfit_getModel_seeded(
+                self._galfit, rings._rings, bhi, blo, True, int(iseed)
+            )
+
+        bhi, blo = np.array(bhi), np.array(blo)
+
+        mod_shape = (self.inp.dim[2], bhi[1] - blo[1], bhi[0] - blo[0])
+        mod = reshapePointer(libBB.Galmod_array(galmod), mod_shape)
+
+        return mod, bhi, blo, galmod
 
 
     # -------------------------------------------------------------------------
@@ -306,7 +339,8 @@ class Sampler:
         method_norm="constant",
         output=None,
         moment_zero=None,
-        regularize={"vdisp": 0.00}
+        regularize={"vdisp": 0.00},
+        sample_iseed=False
     ):
         self.bbobj = bbobj
         self.free_params = free_params
@@ -390,6 +424,21 @@ class Sampler:
                 self.prior_distr[pname] = get_distribution(
                     self.bbobj.priors[pname]["name"], **distr_kwargs
                 )
+
+        self.sample_iseed = sample_iseed
+        if self.sample_iseed:
+            self.freepar_names.append("iseed")
+            self.freepar_idx["iseed"] = len(self.freepar_names) - 1
+
+            iseed_prior = self.bbobj.priors.get(
+                "iseed", dict(name="uniform", loc=0.00, scale=1.00)
+            )
+            distr_kwargs = {
+                key: value for key, value in iseed_prior.items() if key != "name"
+            }
+            self.prior_distr["iseed"] = get_distribution(
+                iseed_prior["name"], **distr_kwargs
+            )
 
         if self.bbobj._beam_kernel is None:
             print(
@@ -539,7 +588,8 @@ class Sampler:
             self.bbobj._update_profile(rings)
 
         # Calculate the model and the boundaries
-        model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
+        seed = _hash_seed(theta[self.freepar_idx["iseed"]]) if self.sample_iseed else None
+        model_, bhi, blo, galmod = self.bbobj._calculate_model(rings, iseed=seed)
 
         # Extract mask and data arrays
         mask = self.bbobj.mask
