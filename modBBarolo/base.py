@@ -33,6 +33,7 @@ is_positive = (
     "radmax",
     "norm",
     "rdisk",
+    "rsep",
 )
 
 _active_sampler = None
@@ -344,6 +345,7 @@ class Sampler:
     ):
         self.bbobj = bbobj
         self.free_params = free_params
+        self._fit_rsep = "rsep" in free_params
 
         self.output = output
         if self.output is None:
@@ -370,9 +372,11 @@ class Sampler:
 
         self.bbobj._opts.add_params(sm=False)
 
-        self.bbobj._setup(self.free_params, useBBres=False)
+        self.bbobj._setup(
+            [p for p in self.free_params if p != "rsep"], useBBres=False
+        )
 
-        self.bbobj.update_prof = any(
+        self.bbobj.update_prof = self._fit_rsep or any(
             sub in string
             for string in self.bbobj.freepar_names
             for sub in ["inc", "phi", "xpos", "ypos", "radmax"]
@@ -392,6 +396,19 @@ class Sampler:
         self.freepar_names = list(self.bbobj.freepar_names)
         self.freepar_idx = dict(self.bbobj.freepar_idx)
         self.prior_distr = dict(self.bbobj.prior_distr)
+
+        if self._fit_rsep:
+            self.freepar_names.append("rsep")
+            self.freepar_idx["rsep"] = len(self.freepar_names) - 1
+
+            distr_kwargs = {
+                key: value
+                for key, value in self.bbobj.priors["rsep"].items()
+                if key != "name"
+            }
+            self.prior_distr["rsep"] = get_distribution(
+                self.bbobj.priors["rsep"]["name"], **distr_kwargs
+            )
 
         if self.method_norm == "constant":
             self.freepar_names.append("norm")
@@ -581,6 +598,17 @@ class Sampler:
         for k in self.freepar_idx:
             if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
+
+        if self._fit_rsep:
+            rsep_val = theta[self.freepar_idx["rsep"]]
+            nr_total = len(self.bbobj.radii)
+            nr_kin = nr_total - 1 if self.bbobj._add_zero else nr_total
+            new_radii = np.linspace(
+                0.50 * rsep_val, 0.50 * rsep_val * (1.00 + 2.00 * (nr_kin - 1.00)), nr_kin
+            )
+            if self.bbobj._add_zero:
+                new_radii = np.concatenate([[0.0], new_radii])
+            self.bbobj._inri.modify_parameter("radii", new_radii)
 
         rings = self.bbobj._update_rings(self.bbobj._inri, theta)
 
