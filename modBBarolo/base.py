@@ -145,8 +145,17 @@ class Init(BayesianBBarolo):
     # -------------------------------------------------------------------------
     def _calculate_model(self, rings, fullcube=False):
         radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
+
+        kwargs = {}
+        if "fullcube" in inspect.signature(super()._calculate_model).parameters:
+            kwargs["fullcube"] = fullcube
+        elif fullcube:
+            raise TypeError(
+                "installed pyBBarolo's _calculate_model() does not support fullcube"
+            )
+
         try:
-            return super()._calculate_model(rings, fullcube=fullcube)
+            return super()._calculate_model(rings, **kwargs)
         finally:
             rings.modify_parameter("radii", radii_saved)
 
