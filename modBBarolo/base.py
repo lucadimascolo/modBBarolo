@@ -614,18 +614,6 @@ class Sampler:
         theta[idx] = mu + tau * np.cumsum(z)
         return theta
 
-    def _physical_vdisp_samples(self):
-        """Vectorized version of _physical_theta's vdisp mapping applied to
-        every row of self.samples; returns an (nsamples, nr) array of
-        physical per-ring vdisp values."""
-        if not self._vdisp_constrained:
-            raise ValueError("_physical_vdisp_samples requires the 'constrained' vdisp prior mode.")
-        idx = self.freepar_idx["vdisp"]
-        z = self.samples[:, idx]
-        mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
-        tau = self.samples[:, self.freepar_idx["tau"]]
-        return mu[:, None] + tau[:, None] * np.cumsum(z, axis=1)
-
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
