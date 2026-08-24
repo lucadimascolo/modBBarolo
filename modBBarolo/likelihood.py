@@ -35,9 +35,12 @@ class Normal:
     def _compute(self, theta):
         """Likelihood function for Gaussian noise without correlation."""
         
-        model, data, _ = self._get_model(theta, convolve=True)
+        model_out = self._get_model(theta, convolve=True)
+        if not isinstance(model_out, tuple):
+            return -np.inf
+        model, data, _ = model_out
 
-        log_like = np.abs(data - model) / self.rms[:, None, None] 
+        log_like = np.abs(data - model) / self.rms[:, None, None]
         log_like = -0.50 * np.nansum(log_like ** 2)
 
         log_norm = np.log(2.00 * np.pi * self.rms**2)
@@ -80,7 +83,10 @@ class NormalRI:
     def _compute(self, theta):
         """Likelihood function for radio-interferometric measurements"""
         
-        model_clean, data, _ = self._get_model(theta, convolve=False)
+        model_out = self._get_model(theta, convolve=False)
+        if not isinstance(model_out, tuple):
+            return -np.inf
+        model_clean, data, _ = model_out
         model_dirty = self._smooth_model(model_clean)
 
         log_like = model_clean * (model_dirty - 2.00 * data)
