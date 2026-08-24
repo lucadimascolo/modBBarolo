@@ -824,31 +824,80 @@ class Sampler:
         self.bbobj.modCalculated = True
 
     # -----------------------------------------------------------------------------
+    # - Collapse z-space vdisp samples to physical per-ring vdisp for reporting
+    # -----------------------------------------------------------------------------
+    def _display_samples(self, use_physical_params=True):
+        if not self._vdisp_constrained:
+            if not use_physical_params:
+                raise ValueError(
+                    "use_physical_params=False requires the 'constrained' vdisp prior mode."
+                )
+            return self.samples, self.freepar_names
+
+        if not use_physical_params:
+            return self.samples, self.freepar_names
+
+        idx_vdisp = np.atleast_1d(self.freepar_idx["vdisp"])
+        idx_mu = int(self.freepar_idx["vdisp_mu"])
+        idx_tau = int(self.freepar_idx["tau"])
+
+        z = self.samples[:, idx_vdisp]
+        mu = self.samples[:, idx_mu]
+        tau = self.samples[:, idx_tau]
+        vdisp_physical = mu[:, None] + tau[:, None] * np.cumsum(z, axis=1)
+
+        vdisp_names = [
+            name[2:] if name.startswith("z_") else name
+            for name in (self.freepar_names[i] for i in idx_vdisp)
+        ]
+
+        drop = set(idx_vdisp.tolist()) | {idx_mu, idx_tau}
+        first_vdisp = int(idx_vdisp[0])
+
+        samples_cols, names, inserted = [], [], False
+        for i, name in enumerate(self.freepar_names):
+            if i in drop:
+                if not inserted and i >= first_vdisp:
+                    samples_cols.append(vdisp_physical)
+                    names.extend(vdisp_names)
+                    inserted = True
+                continue
+            samples_cols.append(self.samples[:, i : i + 1])
+            names.append(name)
+        if not inserted:
+            samples_cols.append(vdisp_physical)
+            names.extend(vdisp_names)
+
+        return np.concatenate(samples_cols, axis=1), names
+
+    # -----------------------------------------------------------------------------
     # - Save corner plot
     # -----------------------------------------------------------------------------
-    def save_corner(self, sigma=10.00, **kwargs):
+    def save_corner(self, sigma=10.00, use_physical_params=True, **kwargs):
+        samples, names = self._display_samples(use_physical_params=use_physical_params)
+
         if sigma is not None:
             edges = np.array(
                 [
                     corner.quantile(s, [0.16, 0.50, 0.84], weights=self.weights)
-                    for s in self.samples.T
+                    for s in samples.T
                 ]
             )
             edges = np.array(
                 [
                     [
                         np.maximum(
-                            e[1] - sigma * (e[1] - e[0]), self.samples[:, i].min()
+                            e[1] - sigma * (e[1] - e[0]), samples[:, i].min()
                         ),
                         np.minimum(
-                            e[1] + sigma * (e[2] - e[1]), self.samples[:, i].max()
+                            e[1] + sigma * (e[2] - e[1]), samples[:, i].max()
                         ),
                     ]
                     for i, e in enumerate(edges)
                 ]
             )
         else:
-            edges = np.array([[s.min(), s.max()] for s in self.samples.T])
+            edges = np.array([[s.min(), s.max()] for s in samples.T])
 
         show_titles = kwargs.pop("show_titles", True)
 
@@ -859,9 +908,9 @@ class Sampler:
                     corner_kwargs[key] = kwargs.pop(key)
 
         corner.corner(
-            self.samples,
+            samples,
             weights=self.weights,
-            labels=self.freepar_names,
+            labels=names,
             show_titles=show_titles,
             range=edges,
             **corner_kwargs,
@@ -874,18 +923,20 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Save 16-50-84 percentiles for each free parameter
     # -----------------------------------------------------------------------------
-    def save_percentiles(self):
+    def save_percentiles(self, use_physical_params=True):
+        samples, names = self._display_samples(use_physical_params=use_physical_params)
+
         edges = np.array(
             [
                 corner.quantile(s, [0.16, 0.50, 0.84], weights=self.weights)
-                for s in self.samples.T
+                for s in samples.T
             ]
         )
 
         header = f"{'param':<20} {'p16':>15} {'p50':>15} {'p84':>15}"
         rows = [
             f"{name:<20} {p16:>15.6e} {p50:>15.6e} {p84:>15.6e}"
-            for name, (p16, p50, p84) in zip(self.freepar_names, edges)
+            for name, (p16, p50, p84) in zip(names, edges)
         ]
 
         with open(f"{self.output}_percentiles.txt", "w") as f:
