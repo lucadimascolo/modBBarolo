@@ -336,6 +336,23 @@ class Sampler:
             }
             self.bbobj.prior_distr["vdisp"] = get_distribution("uniform", **distr_kw)
 
+        # If the user set priors["vdisp"]["name"] == "constrained", vdisp is
+        # reparameterized as a non-centered Gaussian random walk in radius:
+        # vdisp_i = vdisp_mu + tau * cumsum(z)_i, z_i ~ N(0, 1). The "vdisp"
+        # theta slice holds z (not physical vdisp); priors["vdisp_mu"] and
+        # priors["tau"] must be set separately. See Sampler._physical_theta.
+        self._vdisp_constrained = (
+            any(p.split("_")[0] == "vdisp" for p in free_params)
+            and self.bbobj.priors["vdisp"]["name"] == "constrained"
+        )
+        if self._vdisp_constrained:
+            if "vdisp" not in free_params:
+                raise ValueError(
+                    "The 'constrained' vdisp prior mode requires the bare 'vdisp' "
+                    "free parameter (one value per ring), not 'vdisp_single'/'vdisp_func'."
+                )
+            self.bbobj.prior_distr["vdisp"] = get_distribution("norm", loc=0.00, scale=1.00)
+
         self.bbobj._opts.add_params(sm=False)
 
         self.bbobj._setup(
@@ -362,6 +379,12 @@ class Sampler:
         self.freepar_names = list(self.bbobj.freepar_names)
         self.freepar_idx = dict(self.bbobj.freepar_idx)
         self.prior_distr = dict(self.bbobj.prior_distr)
+
+        if self._vdisp_constrained:
+            # These entries hold z-space innovations, not physical vdisp;
+            # relabel so corner plots / percentiles don't read as physical.
+            for i in self.freepar_idx["vdisp"]:
+                self.freepar_names[i] = f"z_{self.freepar_names[i]}"
 
         if self._fit_rsep:
             self.freepar_names.append("rsep")
@@ -408,6 +431,25 @@ class Sampler:
                     self.bbobj.priors[pname]["name"], **distr_kwargs
                 )
 
+        if self._vdisp_constrained:
+            for pname in ("vdisp_mu", "tau"):
+                if pname not in self.bbobj.priors:
+                    raise ValueError(
+                        f"The 'constrained' vdisp prior mode requires priors['{pname}'] "
+                        "to be set before constructing Sampler."
+                    )
+                self.freepar_names.append(pname)
+                self.freepar_idx[pname] = len(self.freepar_names) - 1
+
+                distr_kwargs = {
+                    key: value
+                    for key, value in self.bbobj.priors[pname].items()
+                    if key != "name"
+                }
+                self.prior_distr[pname] = get_distribution(
+                    self.bbobj.priors[pname]["name"], **distr_kwargs
+                )
+
         if self.bbobj._beam_kernel is None:
             print(
                 "Warning. No beam kernel has been built. If your data is beam-convolved, "
@@ -421,6 +463,11 @@ class Sampler:
         for key in regularize.keys():
             if key not in ["vdisp"]:
                 raise ValueError(f"Regularization key '{key}' is not recognized.")
+        if self._vdisp_constrained and regularize.get("vdisp", 0.00) != 0.00:
+            raise ValueError(
+                "regularize['vdisp'] cannot be combined with the 'constrained' "
+                "vdisp prior mode; the random walk already imposes ring-to-ring smoothness."
+            )
         self._regularize = regularize.copy()
 
     # -----------------------------------------------------------------------------
@@ -543,9 +590,40 @@ class Sampler:
         return -self._regularize["vdisp"] * np.mean(np.abs(np.diff(vdisp)) ** alpha)
 
     # -----------------------------------------------------------------------------
+    # - Map z-space vdisp (constrained mode) to physical per-ring vdisp
+    # -----------------------------------------------------------------------------
+    def _physical_theta(self, theta):
+        """Return theta with the 'vdisp' slice mapped from z-space to physical
+        values (vdisp_i = vdisp_mu + tau * cumsum(z)_i) when the 'constrained'
+        vdisp prior mode is active; otherwise returns theta unchanged."""
+        if not self._vdisp_constrained:
+            return theta
+        theta = np.array(theta, copy=True)
+        idx = self.freepar_idx["vdisp"]
+        z = theta[idx]
+        mu = theta[self.freepar_idx["vdisp_mu"]]
+        tau = theta[self.freepar_idx["tau"]]
+        theta[idx] = mu + tau * np.cumsum(z)
+        return theta
+
+    def _physical_vdisp_samples(self):
+        """Vectorized version of _physical_theta's vdisp mapping applied to
+        every row of self.samples; returns an (nsamples, nr) array of
+        physical per-ring vdisp values."""
+        if not self._vdisp_constrained:
+            raise ValueError("_physical_vdisp_samples requires the 'constrained' vdisp prior mode.")
+        idx = self.freepar_idx["vdisp"]
+        z = self.samples[:, idx]
+        mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
+        tau = self.samples[:, self.freepar_idx["tau"]]
+        return mu[:, None] + tau[:, None] * np.cumsum(z, axis=1)
+
+    # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
     def _get_model(self, theta, convolve=False):
+        theta = self._physical_theta(theta)
+
         for k in self.freepar_idx:
             if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
@@ -817,7 +895,46 @@ class Sampler:
             f.write("\n".join([header] + rows) + "\n")
 
         return edges
-    
+
+    # -----------------------------------------------------------------------------
+    # - Save physical vdisp(R) profile (constrained vdisp prior mode only)
+    # -----------------------------------------------------------------------------
+    def save_vdisp_profile(self, plot=True):
+        if not self._vdisp_constrained:
+            raise ValueError("save_vdisp_profile requires the 'constrained' vdisp prior mode.")
+
+        vdisp_samples = self._physical_vdisp_samples()
+        radii = self.bbobj.radii
+
+        edges = np.array(
+            [
+                corner.quantile(col, [0.16, 0.50, 0.84], weights=self.weights)
+                for col in vdisp_samples.T
+            ]
+        )
+
+        header = f"{'radius':<15} {'p16':>15} {'p50':>15} {'p84':>15}"
+        rows = [
+            f"{r:<15.6f} {p16:>15.6e} {p50:>15.6e} {p84:>15.6e}"
+            for r, (p16, p50, p84) in zip(radii, edges)
+        ]
+
+        with open(f"{self.output}_vdisp_profile.txt", "w") as f:
+            f.write("\n".join([header] + rows) + "\n")
+
+        if plot:
+            p16, p50, p84 = edges[:, 0], edges[:, 1], edges[:, 2]
+            plt.figure()
+            plt.fill_between(radii, p16, p84, alpha=0.30, label="16-84%")
+            plt.plot(radii, p50, marker="o", label="median")
+            plt.xlabel("Radius")
+            plt.ylabel("vdisp")
+            plt.legend()
+            plt.savefig(f"{self.output}_vdisp_profile.pdf", format="pdf", dpi=300)
+            plt.close()
+
+        return edges
+
     # -----------------------------------------------------------------------------
     # - Save best-fit model and outputs using the best-fit parameters
     # -----------------------------------------------------------------------------
@@ -830,7 +947,7 @@ class Sampler:
 
         model, _, _ = self._get_model(self.params, convolve=True)
 
-        rings = self.bbobj._update_rings(self.bbobj._inri, self.params)
+        rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(self.params))
 
         if self.bbobj.update_prof:
             self.bbobj._update_profile(rings)
