@@ -141,12 +141,7 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
-    # - Calculate model, guarding against BBarolo's finalModel=True ring-state
-    #   leak (upstream Galfit::getModel temporarily shifts the innermost/
-    #   outermost ring radii for cloud generation and does not revert them
-    #   before returning; since the same Rings object is reused across every
-    #   likelihood evaluation, this compounds over a run). Restoring radii
-    #   here makes modBBarolo correct on stock/unpatched BBarolo builds too.
+    # - Guard against BBarolo's finalModel=True ring-state leak
     # -------------------------------------------------------------------------
     def _calculate_model(self, rings, fullcube=False):
         radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
@@ -353,10 +348,7 @@ class Sampler:
             self.bbobj.prior_distr["vdisp"] = get_distribution("uniform", **distr_kw)
 
         # If the user set priors["vdisp"]["name"] == "constrained", vdisp is
-        # reparameterized as a non-centered Gaussian random walk in radius:
-        # vdisp_i = vdisp_mu + tau * cumsum(z)_i, z_i ~ N(0, 1). The "vdisp"
-        # theta slice holds z (not physical vdisp); priors["vdisp_mu"] and
-        # priors["tau"] must be set separately. See Sampler._physical_theta.
+        # reparameterized as vdisp_i = vdisp_mu + tau * cumsum(z)_i, z_i ~ N(0, 1).
         self._vdisp_constrained = (
             any(p.split("_")[0] == "vdisp" for p in free_params)
             and self.bbobj.priors["vdisp"]["name"] == "constrained"
@@ -890,6 +882,7 @@ class Sampler:
         plt.savefig(f"{self.output}_corner.pdf", format="pdf", dpi=300)
         plt.close()
 
+
     # -----------------------------------------------------------------------------
     # - Save 16-50-84 percentiles for each free parameter
     # -----------------------------------------------------------------------------
@@ -912,44 +905,6 @@ class Sampler:
 
         return edges
 
-    # -----------------------------------------------------------------------------
-    # - Save physical vdisp(R) profile (constrained vdisp prior mode only)
-    # -----------------------------------------------------------------------------
-    def save_vdisp_profile(self, plot=True):
-        if not self._vdisp_constrained:
-            raise ValueError("save_vdisp_profile requires the 'constrained' vdisp prior mode.")
-
-        vdisp_samples = self._physical_vdisp_samples()
-        radii = self.bbobj.radii
-
-        edges = np.array(
-            [
-                corner.quantile(col, [0.16, 0.50, 0.84], weights=self.weights)
-                for col in vdisp_samples.T
-            ]
-        )
-
-        header = f"{'radius':<15} {'p16':>15} {'p50':>15} {'p84':>15}"
-        rows = [
-            f"{r:<15.6f} {p16:>15.6e} {p50:>15.6e} {p84:>15.6e}"
-            for r, (p16, p50, p84) in zip(radii, edges)
-        ]
-
-        with open(f"{self.output}_vdisp_profile.txt", "w") as f:
-            f.write("\n".join([header] + rows) + "\n")
-
-        if plot:
-            p16, p50, p84 = edges[:, 0], edges[:, 1], edges[:, 2]
-            plt.figure()
-            plt.fill_between(radii, p16, p84, alpha=0.30, label="16-84%")
-            plt.plot(radii, p50, marker="o", label="median")
-            plt.xlabel("Radius")
-            plt.ylabel("vdisp")
-            plt.legend()
-            plt.savefig(f"{self.output}_vdisp_profile.pdf", format="pdf", dpi=300)
-            plt.close()
-
-        return edges
 
     # -----------------------------------------------------------------------------
     # - Save best-fit model and outputs using the best-fit parameters
