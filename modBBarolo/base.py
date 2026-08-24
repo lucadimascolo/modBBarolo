@@ -660,18 +660,6 @@ class Sampler:
         theta[idx] = mu + tau * np.cumsum(z)
         return theta
 
-    def _physical_vdisp_samples(self):
-        """Vectorized version of _physical_theta's vdisp mapping applied to
-        every row of self.samples; returns an (nsamples, nr) array of
-        physical per-ring vdisp values."""
-        if not self._vdisp_constrained:
-            raise ValueError("_physical_vdisp_samples requires the 'constrained' vdisp prior mode.")
-        idx = self.freepar_idx["vdisp"]
-        z = self.samples[:, idx]
-        mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
-        tau = self.samples[:, self.freepar_idx["tau"]]
-        return mu[:, None] + tau[:, None] * np.cumsum(z, axis=1)
-
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
     # ------------------------------------------------------------------------------
@@ -948,45 +936,6 @@ class Sampler:
 
         with open(f"{self.output}_percentiles.txt", "w") as f:
             f.write("\n".join([header] + rows) + "\n")
-
-        return edges
-
-    # -----------------------------------------------------------------------------
-    # - Save physical vdisp(R) profile (constrained vdisp prior mode only)
-    # -----------------------------------------------------------------------------
-    def save_vdisp_profile(self, plot=True):
-        if not self._vdisp_constrained:
-            raise ValueError("save_vdisp_profile requires the 'constrained' vdisp prior mode.")
-
-        vdisp_samples = self._physical_vdisp_samples()
-        radii = self.bbobj.radii
-
-        edges = np.array(
-            [
-                corner.quantile(col, [0.16, 0.50, 0.84], weights=self.weights)
-                for col in vdisp_samples.T
-            ]
-        )
-
-        header = f"{'radius':<15} {'p16':>15} {'p50':>15} {'p84':>15}"
-        rows = [
-            f"{r:<15.6f} {p16:>15.6e} {p50:>15.6e} {p84:>15.6e}"
-            for r, (p16, p50, p84) in zip(radii, edges)
-        ]
-
-        with open(f"{self.output}_vdisp_profile.txt", "w") as f:
-            f.write("\n".join([header] + rows) + "\n")
-
-        if plot:
-            p16, p50, p84 = edges[:, 0], edges[:, 1], edges[:, 2]
-            plt.figure()
-            plt.fill_between(radii, p16, p84, alpha=0.30, label="16-84%")
-            plt.plot(radii, p50, marker="o", label="median")
-            plt.xlabel("Radius")
-            plt.ylabel("vdisp")
-            plt.legend()
-            plt.savefig(f"{self.output}_vdisp_profile.pdf", format="pdf", dpi=300)
-            plt.close()
 
         return edges
 
