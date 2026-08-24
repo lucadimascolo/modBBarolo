@@ -141,6 +141,22 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
+    # - Calculate model, guarding against BBarolo's finalModel=True ring-state
+    #   leak (upstream Galfit::getModel temporarily shifts the innermost/
+    #   outermost ring radii for cloud generation and does not revert them
+    #   before returning; since the same Rings object is reused across every
+    #   likelihood evaluation, this compounds over a run). Restoring radii
+    #   here makes modBBarolo correct on stock/unpatched BBarolo builds too.
+    # -------------------------------------------------------------------------
+    def _calculate_model(self, rings, fullcube=False):
+        radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
+        try:
+            return super()._calculate_model(rings, fullcube=fullcube)
+        finally:
+            rings.modify_parameter("radii", radii_saved)
+
+
+    # -------------------------------------------------------------------------
     # - Import beam kernel from a FITS
     # -------------------------------------------------------------------------
     def add_beam_from_fits(self, fname, normalize=None):
