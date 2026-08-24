@@ -148,29 +148,34 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
-    # - Calculate model, optionally overriding the cloud-generation RNG seed
+    # - Calculate model, optionally overriding the cloud-generation RNG seed.
+    #   Also guards against BBarolo's finalModel=True ring-state leak
     # -------------------------------------------------------------------------
     def _calculate_model(self, rings, iseed=None, fullcube=False):
-        _, ys, xs = self.data.shape
-        bhi, blo = (ctypes.c_int * 2)(xs, ys), (ctypes.c_int * 2)(0)
+        radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
+        try:
+            _, ys, xs = self.data.shape
+            bhi, blo = (ctypes.c_int * 2)(xs, ys), (ctypes.c_int * 2)(0)
 
-        if not fullcube:
-            bhi, blo = (ctypes.c_int * 2)(0), (ctypes.c_int * 2)(0)
-            libBB.Galfit_getModelSize(self._galfit, rings._rings, bhi, blo)
+            if not fullcube:
+                bhi, blo = (ctypes.c_int * 2)(0), (ctypes.c_int * 2)(0)
+                libBB.Galfit_getModelSize(self._galfit, rings._rings, bhi, blo)
 
-        if iseed is None:
-            galmod = libBB.Galfit_getModel(self._galfit, rings._rings, bhi, blo, True)
-        else:
-            galmod = libBB.Galfit_getModel_seeded(
-                self._galfit, rings._rings, bhi, blo, True, int(iseed)
-            )
+            if iseed is None:
+                galmod = libBB.Galfit_getModel(self._galfit, rings._rings, bhi, blo, True)
+            else:
+                galmod = libBB.Galfit_getModel_seeded(
+                    self._galfit, rings._rings, bhi, blo, True, int(iseed)
+                )
 
-        bhi, blo = np.array(bhi), np.array(blo)
+            bhi, blo = np.array(bhi), np.array(blo)
 
-        mod_shape = (self.inp.dim[2], bhi[1] - blo[1], bhi[0] - blo[0])
-        mod = reshapePointer(libBB.Galmod_array(galmod), mod_shape)
+            mod_shape = (self.inp.dim[2], bhi[1] - blo[1], bhi[0] - blo[0])
+            mod = reshapePointer(libBB.Galmod_array(galmod), mod_shape)
 
-        return mod, bhi, blo, galmod
+            return mod, bhi, blo, galmod
+        finally:
+            rings.modify_parameter("radii", radii_saved)
 
 
     # -------------------------------------------------------------------------
