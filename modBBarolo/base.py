@@ -176,10 +176,7 @@ class Init(BayesianBBarolo):
         if boost is None or np.all(boost == 1.00):
             return self._render_model(rings, fullcube=fullcube)
 
-        # Galmod draws cdens*dens clouds per unit area in each ring, whose
-        # total flux is set by dens alone, and skips rings with dens=0. Each
-        # group of boosted rings is rendered on its own with dens*factor and
-        # divided by factor: more clouds, same flux.
+        # Boosted rings rendered apart with dens*factor, then divided by factor
         dens_saved = np.array(rings.r["dens"], dtype=np.float32, copy=True)
         boosted = 0.00
 
@@ -272,8 +269,7 @@ class Init(BayesianBBarolo):
         pixsizeX = abs(hdr["CDELT1"]) * 3600  # degrees -> arcsec
         pixsizeY = abs(hdr["CDELT2"]) * 3600  # degrees -> arcsec
 
-        # Per-channel beam: CASA writes a BEAMS binary-table extension, with
-        # BMAJ/BMIN in arcsec and BPA in degrees (unlike the primary header)
+        # Per-channel beam: CASA writes a BEAMS binary-table extension
         try:
             with fits.open(self.inp.fname) as hdul:
                 beams = hdul["BEAMS"]
@@ -343,7 +339,7 @@ class Init(BayesianBBarolo):
         image_shape = (ny, nx)
         kernel_shape = self._beam_kernel.shape[-2:]
 
-        # Full-convolution size, rounded up to a fast FFT length
+        # Fast FFT length
         self._beam_fft_shape = tuple(
             scipy.fft.next_fast_len(int(i + k - 1), real=True)
             for i, k in zip(image_shape, kernel_shape)
@@ -900,8 +896,7 @@ class Sampler:
         )
 
         if self._vdisp_constrained:
-            # Replace the z medians with the z values that map onto the median
-            # physical vdisp, so the best-fit model matches the percentiles.
+            # z values mapping onto the median physical vdisp
             idx = self.freepar_idx["vdisp"]
             mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
             tau = self.samples[:, self.freepar_idx["tau"]]
