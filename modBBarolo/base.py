@@ -20,7 +20,7 @@ from .likelihood import Normal
 
 import multiprocess
 
-multiprocess.set_start_method("fork")
+_mp_context = multiprocess.get_context("fork")
 
 is_positive = (
     "vrot",
@@ -60,7 +60,7 @@ class Init(BayesianBBarolo):
         self._vrot_r0_removed_idx = None
         self._full_freepar_idx = None
 
-        if beam is not None:
+        if beam is not None and beam is not False:
             if isinstance(beam, str):
                 self.add_beam_from_fits(beam, normalize=normalize_beam)
             elif isinstance(beam, bool) and beam:
@@ -83,6 +83,8 @@ class Init(BayesianBBarolo):
         if add_zero:
             self.radii = np.concatenate([[0.0], self.radii])
 
+        if len(self.radii) < 2:
+            raise ValueError("At least two rings are required: use rnum >= 2 or add_zero=True.")
 
         init = dict(init)
 
@@ -287,6 +289,12 @@ class Init(BayesianBBarolo):
             bmaj_arr = np.array([hdr["BMAJ"] * 3600])
             bmin_arr = np.array([hdr["BMIN"] * 3600])
             bpa_arr  = np.array([hdr.get("BPA", 0)])
+
+        if len(bmaj_arr) not in (1, self.inp.dim[2]):
+            raise ValueError(
+                f"The BEAMS table has {len(bmaj_arr)} rows for {self.inp.dim[2]} channels; "
+                "only one beam per channel (single polarization) is supported."
+            )
 
         kernels = [
             self._build_single_kernel(bmaj, bmin, bpa, pixsizeX, pixsizeY)
@@ -763,115 +771,120 @@ class Sampler:
         ndim = len(self.freepar_names)
 
         if threads > 1:
-            pool = multiprocess.Pool(threads)
+            pool = _mp_context.Pool(threads)
         else:
             pool = None
 
-        if method == "nautilus":
-            nlive = 1000
-            for key in ["nlive", "n_live"]:
-                nlive = kwargs.pop(key, nlive)
+        try:
+            if method == "nautilus":
+                nlive = 1000
+                for key in ["nlive", "n_live"]:
+                    nlive = kwargs.pop(key, nlive)
 
-            discard_exploration = kwargs.pop("discard_exploration", True)
+                discard_exploration = kwargs.pop("discard_exploration", True)
 
-            sampler_kwargs = {}
-            for key in inspect.signature(nautilus.Sampler).parameters.keys():
-                if key not in [
-                    "loglikelihood",
-                    "prior_transform",
-                    "n_dim",
-                    "n_live",
-                    "filepath",
-                    "resume",
-                    "pool",
-                ]:
-                    if key in kwargs:
-                        sampler_kwargs[key] = kwargs.pop(key)
+                sampler_kwargs = {}
+                for key in inspect.signature(nautilus.Sampler).parameters.keys():
+                    if key not in [
+                        "loglikelihood",
+                        "prior_transform",
+                        "n_dim",
+                        "n_live",
+                        "filepath",
+                        "resume",
+                        "pool",
+                    ]:
+                        if key in kwargs:
+                            sampler_kwargs[key] = kwargs.pop(key)
 
-            run_kwargs = {}
-            for key in inspect.signature(nautilus.Sampler.run).parameters.keys():
-                if key not in ["verbose", "discard_exploration"]:
-                    if key in kwargs:
-                        run_kwargs[key] = kwargs.pop(key)
+                run_kwargs = {}
+                for key in inspect.signature(nautilus.Sampler.run).parameters.keys():
+                    if key not in ["verbose", "discard_exploration"]:
+                        if key in kwargs:
+                            run_kwargs[key] = kwargs.pop(key)
 
-            filepath = f"{self.output}_checkpoint.h5" if checkpoint else None
+                filepath = f"{self.output}_checkpoint.h5" if checkpoint else None
 
-            self.sampler = nautilus.Sampler(
-                prior=_mp_prior_transform,
-                likelihood=_mp_log_likelihood,
-                n_live=nlive,
-                n_dim=ndim,
-                filepath=filepath,
-                resume=resume,
-                pool=pool,
-                **sampler_kwargs,
-            )
-
-            self.sampler.run(
-                verbose=True, discard_exploration=discard_exploration, **run_kwargs
-            )
-
-            self.samples, weights, _ = self.sampler.posterior()
-            self.weights = np.exp(weights - np.max(weights))
-
-        elif method == "emcee":
-            nwalkers = kwargs.pop("nwalkers", max(4 * ndim, 20))
-            nsteps = kwargs.pop("nsteps", 5000)
-            discard = kwargs.pop("discard", 0)
-            thin = kwargs.pop("thin", 1)
-
-            sampler_kwargs = {}
-            for key in inspect.signature(emcee.EnsembleSampler).parameters.keys():
-                if key not in [
-                    "nwalkers",
-                    "ndim",
-                    "log_prob_fn",
-                    "pool",
-                    "backend",
-                    "args",
-                    "kwargs",
-                ]:
-                    if key in kwargs:
-                        sampler_kwargs[key] = kwargs.pop(key)
-
-            run_kwargs = {}
-            for key in inspect.signature(emcee.EnsembleSampler.run_mcmc).parameters.keys():
-                if key not in ["initial_state", "nsteps", "progress"]:
-                    if key in kwargs:
-                        run_kwargs[key] = kwargs.pop(key)
-
-            if checkpoint:
-                backend = emcee.backends.HDFBackend(f"{self.output}_checkpoint_emcee.h5")
-                if not resume:
-                    backend.reset(nwalkers, ndim)
-            else:
-                backend = None
-
-            self.sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, _mp_log_posterior, pool=pool, backend=backend, **sampler_kwargs
-            )
-
-            # 'nsteps' is a total iteration target, not an increment: resuming
-            # only runs the remaining iterations needed to reach it.
-            completed = backend.iteration if backend is not None and backend.initialized else 0
-            remaining = max(nsteps - completed, 0)
-
-            if completed > 0:
-                initial_state = None
-            else:
-                initial_state = np.array(
-                    [self._prior_transform(np.random.uniform(size=ndim)) for _ in range(nwalkers)]
+                self.sampler = nautilus.Sampler(
+                    prior=_mp_prior_transform,
+                    likelihood=_mp_log_likelihood,
+                    n_live=nlive,
+                    n_dim=ndim,
+                    filepath=filepath,
+                    resume=resume,
+                    pool=pool,
+                    **sampler_kwargs,
                 )
 
-            if remaining > 0:
-                self.sampler.run_mcmc(initial_state, remaining, progress=True, **run_kwargs)
-            else:
-                print(
-                    f"Already at {completed} iterations (nsteps={nsteps}); nothing to run."
+                self.sampler.run(
+                    verbose=True, discard_exploration=discard_exploration, **run_kwargs
                 )
 
-            self.samples = self.sampler.get_chain(discard=discard, thin=thin, flat=True)
-            self.weights = np.ones(len(self.samples))
+                self.samples, weights, _ = self.sampler.posterior()
+                self.weights = np.exp(weights - np.max(weights))
+
+            elif method == "emcee":
+                nwalkers = kwargs.pop("nwalkers", max(4 * ndim, 20))
+                nsteps = kwargs.pop("nsteps", 5000)
+                discard = kwargs.pop("discard", 0)
+                thin = kwargs.pop("thin", 1)
+
+                sampler_kwargs = {}
+                for key in inspect.signature(emcee.EnsembleSampler).parameters.keys():
+                    if key not in [
+                        "nwalkers",
+                        "ndim",
+                        "log_prob_fn",
+                        "pool",
+                        "backend",
+                        "args",
+                        "kwargs",
+                    ]:
+                        if key in kwargs:
+                            sampler_kwargs[key] = kwargs.pop(key)
+
+                run_kwargs = {}
+                for key in inspect.signature(emcee.EnsembleSampler.run_mcmc).parameters.keys():
+                    if key not in ["initial_state", "nsteps", "progress"]:
+                        if key in kwargs:
+                            run_kwargs[key] = kwargs.pop(key)
+
+                if checkpoint:
+                    backend = emcee.backends.HDFBackend(f"{self.output}_checkpoint_emcee.h5")
+                    if not resume:
+                        backend.reset(nwalkers, ndim)
+                else:
+                    backend = None
+
+                self.sampler = emcee.EnsembleSampler(
+                    nwalkers, ndim, _mp_log_posterior, pool=pool, backend=backend, **sampler_kwargs
+                )
+
+                # 'nsteps' is a total iteration target, not an increment: resuming
+                # only runs the remaining iterations needed to reach it.
+                completed = backend.iteration if backend is not None and backend.initialized else 0
+                remaining = max(nsteps - completed, 0)
+
+                if completed > 0:
+                    initial_state = None
+                else:
+                    initial_state = np.array(
+                        [self._prior_transform(np.random.uniform(size=ndim)) for _ in range(nwalkers)]
+                    )
+
+                if remaining > 0:
+                    self.sampler.run_mcmc(initial_state, remaining, progress=True, **run_kwargs)
+                else:
+                    print(
+                        f"Already at {completed} iterations (nsteps={nsteps}); nothing to run."
+                    )
+
+                self.samples = self.sampler.get_chain(discard=discard, thin=thin, flat=True)
+                self.weights = np.ones(len(self.samples))
+        except BaseException:
+            if pool is not None:
+                pool.terminate()
+            raise
 
         if pool is not None:
             pool.close()
@@ -1028,7 +1041,12 @@ class Sampler:
             )
             return
 
-        model, _, _ = self._get_model(self.params, convolve=True)
+        model_out = self._get_model(self.params, convolve=True)
+        if not isinstance(model_out, tuple):
+            raise ValueError(
+                "The best-fit parameters fall outside the allowed range: no model can be built."
+            )
+        model = model_out[0]
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(self.params))
 
@@ -1041,7 +1059,9 @@ class Sampler:
         bhi = (ctypes.c_int * 2)(xs, ys)
         blo = (ctypes.c_int * 2)(0, 0)
 
+        radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
         galmod = libBB.Galfit_getModel(self.bbobj._galfit, rings._rings, bhi, blo, True)
+        rings.modify_parameter("radii", radii_saved)
 
         buffer = reshapePointer(libBB.Galmod_array(galmod), model.shape)
         buffer[:] = model
