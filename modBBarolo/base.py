@@ -131,11 +131,18 @@ class Init(BayesianBBarolo):
 
             saved_idx = self.freepar_idx
             self.freepar_idx = self._full_freepar_idx
-            result = super()._update_rings(rings, theta)
+            rings = super()._update_rings(rings, theta)
             self.freepar_idx = saved_idx
-            return result
+        else:
+            rings = super()._update_rings(rings, theta)
 
-        return super()._update_rings(rings, theta)
+        # vrot(r=0) is zero also when vrot is fixed, single or functional
+        if self._add_zero and rings.r["vrot"][0] != 0.00:
+            vrot = np.array(rings.r["vrot"], copy=True)
+            vrot[0] = 0.00
+            rings.modify_parameter("vrot", vrot, makeobj=True)
+
+        return rings
 
 
     # -------------------------------------------------------------------------
