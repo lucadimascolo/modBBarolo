@@ -56,6 +56,7 @@ class Init(BayesianBBarolo):
         self._beam_crop_start = None
 
         self._add_zero = False
+        self._cdens_boost = None
         self._vrot_r0_removed_idx = None
         self._full_freepar_idx = None
 
@@ -86,17 +87,13 @@ class Init(BayesianBBarolo):
         init = dict(init)
 
         if cdens_boost is not None:
-            nr = len(self.radii)
-            dens0 = init.get("dens", 1.00)
-            dens_arr = (np.array(dens0, dtype=float) if hasattr(dens0, "__len__")
-                        else np.full(nr, float(dens0)))
             if isinstance(cdens_boost, dict):
+                self._cdens_boost = np.ones(len(self.radii))
                 for cdens_boost_idx in cdens_boost.keys():
                     if cdens_boost[cdens_boost_idx] is not None:
-                        dens_arr[cdens_boost_idx] *= cdens_boost[cdens_boost_idx]
+                        self._cdens_boost[cdens_boost_idx] *= cdens_boost[cdens_boost_idx]
             else:
                 raise ValueError("'cdens_boost'should be a dict.")
-            init["dens"] = dens_arr
 
         self.init(radii=self.radii, **init)
 
@@ -144,7 +141,7 @@ class Init(BayesianBBarolo):
     # -------------------------------------------------------------------------
     # - Guard against BBarolo's finalModel=True ring-state leak
     # -------------------------------------------------------------------------
-    def _calculate_model(self, rings, fullcube=False):
+    def _render_model(self, rings, fullcube=False):
         radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
 
         kwargs = {}
@@ -159,6 +156,40 @@ class Init(BayesianBBarolo):
             return super()._calculate_model(rings, **kwargs)
         finally:
             rings.modify_parameter("radii", radii_saved)
+
+
+    # -------------------------------------------------------------------------
+    # - Calculate model, drawing more clouds in the cdens_boost rings
+    # -------------------------------------------------------------------------
+    def _calculate_model(self, rings, fullcube=False):
+        boost = self._cdens_boost
+        if boost is None or np.all(boost == 1.00):
+            return self._render_model(rings, fullcube=fullcube)
+
+        # Galmod draws cdens*dens clouds per unit area in each ring, whose
+        # total flux is set by dens alone, and skips rings with dens=0. Each
+        # group of boosted rings is rendered on its own with dens*factor and
+        # divided by factor: more clouds, same flux.
+        dens_saved = np.array(rings.r["dens"], dtype=np.float32, copy=True)
+        boosted = 0.00
+
+        try:
+            for factor in np.unique(boost[boost != 1.00]):
+                dens = np.where(boost == factor, dens_saved * factor, 0.00)
+                rings.modify_parameter("dens", dens, makeobj=True)
+
+                mod, _, _, galmod = self._render_model(rings, fullcube=fullcube)
+                boosted = boosted + mod / factor
+                libBB.Galmod_delete(galmod)
+
+            dens = np.where(boost == 1.00, dens_saved, 0.00)
+            rings.modify_parameter("dens", dens, makeobj=True)
+
+            mod, bhi, blo, galmod = self._render_model(rings, fullcube=fullcube)
+            mod += boosted
+            return mod, bhi, blo, galmod
+        finally:
+            rings.modify_parameter("dens", dens_saved, makeobj=True)
 
 
     # -------------------------------------------------------------------------
