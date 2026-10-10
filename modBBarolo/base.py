@@ -13,6 +13,7 @@ import types
 from datetime import datetime
 
 import numpy as np
+import scipy.fft
 from astropy.io import fits
 from astropy import units
 
@@ -342,7 +343,11 @@ class Init(BayesianBBarolo):
         image_shape = (ny, nx)
         kernel_shape = self._beam_kernel.shape[-2:]
 
-        self._beam_fft_shape = tuple(int(i + k - 1) for i, k in zip(image_shape, kernel_shape))
+        # Full-convolution size, rounded up to a fast FFT length
+        self._beam_fft_shape = tuple(
+            scipy.fft.next_fast_len(int(i + k - 1), real=True)
+            for i, k in zip(image_shape, kernel_shape)
+        )
 
         self._beam_kernel_fft = np.fft.rfft2(
             self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
