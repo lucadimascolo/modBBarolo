@@ -97,3 +97,66 @@ class NormalRI:
         regularization = self._regularize_vdisp(theta, alpha=1.00)
         
         return log_like + log_norm + regularization
+
+
+# -----------------------------------------------------------------------------
+# - Radio-interferometric likelihood in Fourier space
+# -----------------------------------------------------------------------------
+class NormalFourier(NormalRI):
+    def __init__(self, rms=None, threshold=1.00E-02):
+        super().__init__(rms=rms)
+        self.threshold = threshold
+
+    def _build(self, data, beam=None, **kwargs):
+        out = super()._build(data, **kwargs)
+
+        if beam is None:
+            raise ValueError("The 'NormalFourier' likelihood requires a beam kernel.")
+
+        nchans, ny, nx = data.shape
+        kernel = np.broadcast_to(beam, (nchans,) + beam.shape[-2:])
+
+        # Kernel on the image grid, with its peak at the origin
+        grid = np.zeros((nchans, ny, nx))
+        for c in range(nchans):
+            y0, x0 = np.unravel_index(np.argmax(kernel[c]), kernel[c].shape)
+            iy = np.arange(kernel.shape[1]) - y0
+            ix = np.arange(kernel.shape[2]) - x0
+            sy = (iy >= -(ny // 2)) & (iy < ny - ny // 2)
+            sx = (ix >= -(nx // 2)) & (ix < nx - nx // 2)
+            grid[c][np.ix_(iy[sy] % ny, ix[sx] % nx)] = kernel[c][np.ix_(sy, sx)]
+
+        beam_fft = np.fft.rfft2(grid, axes=(-2, -1)).real
+
+        # Multiplicity of the rfft2 half-plane
+        pair = np.full(nx // 2 + 1, 2.00)
+        pair[0] = 1.00
+        if nx % 2 == 0:
+            pair[-1] = 1.00
+
+        # Inverse variance of the Fourier pixels sampled by the beam
+        keep = beam_fft > self.threshold * beam_fft.max(axis=(-2, -1), keepdims=True)
+        icov = pair / (ny * nx * self.rms[:, None, None] ** 2 * np.where(keep, beam_fft, 1.00))
+        icov = np.where(keep, icov, 0.00)
+
+        out["data_fft"] = np.fft.rfft2(np.nan_to_num(data), axes=(-2, -1))
+        out["beam_fft"] = beam_fft
+        out["icov"] = icov
+        return out
+
+    def _compute(self, theta):
+        """Likelihood function for radio-interferometric measurements in Fourier space"""
+
+        model_out = self._get_model(theta, convolve=False)
+        if not isinstance(model_out, tuple):
+            return -np.inf
+        model, _, _ = model_out
+
+        model_fft = np.fft.rfft2(np.nan_to_num(model), axes=(-2, -1))
+        resid = self.data_fft - self.beam_fft * model_fft
+
+        log_like = -0.50 * np.sum(self.icov * (resid.real ** 2 + resid.imag ** 2))
+
+        regularization = self._regularize_vdisp(theta, alpha=1.00)
+
+        return log_like + regularization

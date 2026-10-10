@@ -781,7 +781,10 @@ class Sampler:
         if method not in _methods:
             raise ValueError(f"Method {method} not recognized. Please use one of: {_methods}")
 
-        for key, value in self._likelihood._build(self.bbobj.data, **likelihood_kwargs).items():
+        likelihood_built = self._likelihood._build(
+            self.bbobj.data, beam=self.bbobj._beam_kernel, **likelihood_kwargs
+        )
+        for key, value in likelihood_built.items():
             setattr(self, key, value)
         self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
 
