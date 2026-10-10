@@ -881,7 +881,19 @@ class Sampler:
             [corner.quantile(s, 0.50, weights=self.weights)[0] for s in self.samples.T]
         )
 
-        self.bbobj.params = self.params[: len(self.bbobj.freepar_names)]
+        if self._vdisp_constrained:
+            # Replace the z medians with the z values that map onto the median
+            # physical vdisp, so the best-fit model matches the percentiles.
+            idx = self.freepar_idx["vdisp"]
+            mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
+            tau = self.samples[:, self.freepar_idx["tau"]]
+            vdisp = mu[:, None] + tau[:, None] * np.cumsum(self.samples[:, idx], axis=1)
+            vdisp = np.array([corner.quantile(v, 0.50, weights=self.weights)[0] for v in vdisp.T])
+
+            mu, tau = self.params[self.freepar_idx["vdisp_mu"]], self.params[self.freepar_idx["tau"]]
+            self.params[idx] = np.diff(vdisp, prepend=mu) / tau if tau > 0.00 else 0.00
+
+        self.bbobj.params = self._physical_theta(self.params)[: len(self.bbobj.freepar_names)]
         self.bbobj.modCalculated = True
 
     # -----------------------------------------------------------------------------
