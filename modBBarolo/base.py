@@ -17,7 +17,7 @@ import scipy.fft
 from astropy.io import fits
 from astropy import units
 
-from .likelihood import Normal
+from .likelihood import Normal, NormalRI
 
 import multiprocess
 
@@ -334,7 +334,7 @@ class Init(BayesianBBarolo):
                     self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
 
 
-    def _build_fft_beam(self):
+    def _build_fft_beam(self, center="stamp"):
         _, ny, nx = self.data.shape
         image_shape = (ny, nx)
         kernel_shape = self._beam_kernel.shape[-2:]
@@ -349,14 +349,31 @@ class Init(BayesianBBarolo):
             self._beam_kernel, s=self._beam_fft_shape, axes=(-2, -1)
         )
 
-        # Crop-back offset and padding
-        if self._beam_kernel.ndim == 2:
-            self._beam_crop_start = np.unravel_index(
-                np.argmax(self._beam_kernel), kernel_shape
-            )
+        # Crop-back offset
+        if center == "stamp":
+            # Stamp centre, with a half-pixel shift for even sizes
+            stamp = [0.50 * (k - 1) for k in kernel_shape]
+            start = [int(np.ceil(c)) for c in stamp]
+            shift = [s - c for s, c in zip(start, stamp)]
+
+            if any(shift):
+                fy = np.fft.fftfreq(self._beam_fft_shape[0])[:, None]
+                fx = np.fft.rfftfreq(self._beam_fft_shape[1])[None, :]
+                ramp = np.exp(-2.00j * np.pi * (fy * shift[0] + fx * shift[1]))
+                self._beam_kernel_fft = self._beam_kernel_fft * ramp
+
+            self._beam_crop_start = tuple(start)
+        elif center == "peak":
+            # Kernel peak, per channel
+            if self._beam_kernel.ndim == 2:
+                self._beam_crop_start = np.unravel_index(
+                    np.argmax(self._beam_kernel), kernel_shape
+                )
+            else:
+                flat_idx = self._beam_kernel.reshape(self._beam_kernel.shape[0], -1).argmax(axis=1)
+                self._beam_crop_start = np.unravel_index(flat_idx, kernel_shape)
         else:
-            flat_idx = self._beam_kernel.reshape(self._beam_kernel.shape[0], -1).argmax(axis=1)
-            self._beam_crop_start = np.unravel_index(flat_idx, kernel_shape)
+            raise ValueError("Invalid value for 'center' argument.")
 
 
 # -----------------------------------------------------------------------------
@@ -522,15 +539,17 @@ class Sampler:
                     self.bbobj.priors[pname]["name"], **distr_kwargs
                 )
 
+        self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
+
         if self.bbobj._beam_kernel is None:
             print(
                 "Warning. No beam kernel has been built. If your data is beam-convolved, "
                 "please run 'bbobj.build_beam_from_header()' before loading the sampler."
             )
         else:
-            self.bbobj._build_fft_beam()
-
-        self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
+            # Same convention as socca
+            center = "peak" if isinstance(self._likelihood, NormalRI) else "stamp"
+            self.bbobj._build_fft_beam(center=center)
 
         for key in regularize.keys():
             if key not in ["vdisp"]:
