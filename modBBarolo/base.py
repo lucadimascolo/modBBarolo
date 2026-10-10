@@ -493,6 +493,11 @@ class Sampler:
                 "regularize['vdisp'] cannot be combined with the 'constrained' "
                 "vdisp prior mode; the random walk already imposes ring-to-ring smoothness."
             )
+        if regularize.get("vdisp", 0.00) != 0.00 and len(self.freepar_idx.get("vdisp", [])) < 2:
+            raise ValueError(
+                "regularize['vdisp'] requires the bare 'vdisp' free parameter "
+                "(one value per ring) with at least two rings."
+            )
         self._regularize = regularize.copy()
 
     # -----------------------------------------------------------------------------
@@ -609,10 +614,11 @@ class Sampler:
     # - Regularization term for velocity dispersion
     # -----------------------------------------------------------------------------
     def _regularize_vdisp(self, theta, alpha=1.00):
-        if self._regularize["vdisp"] == 0.00 and ("vdisp" not in self.freepar_idx):
+        strength = self._regularize.get("vdisp", 0.00)
+        if strength == 0.00 or len(self.freepar_idx.get("vdisp", [])) < 2:
             return 0.00
         vdisp = theta[self.freepar_idx["vdisp"]]
-        return -self._regularize["vdisp"] * np.mean(np.abs(np.diff(vdisp)) ** alpha)
+        return -strength * np.mean(np.abs(np.diff(vdisp)) ** alpha)
 
     # -----------------------------------------------------------------------------
     # - Map z-space vdisp (constrained mode) to physical per-ring vdisp
