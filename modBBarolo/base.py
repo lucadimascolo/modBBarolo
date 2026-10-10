@@ -14,6 +14,7 @@ from datetime import datetime
 
 import numpy as np
 from astropy.io import fits
+from astropy import units
 
 from .likelihood import Normal
 
@@ -230,13 +231,20 @@ class Init(BayesianBBarolo):
         pixsizeX = abs(hdr["CDELT1"]) * 3600  # degrees -> arcsec
         pixsizeY = abs(hdr["CDELT2"]) * 3600  # degrees -> arcsec
 
-        # Per-channel beam: CASA writes a BEAMS binary-table extension
+        # Per-channel beam: CASA writes a BEAMS binary-table extension, with
+        # BMAJ/BMIN in arcsec and BPA in degrees (unlike the primary header)
         try:
             with fits.open(self.inp.fname) as hdul:
-                beams = hdul["BEAMS"].data
-            bmaj_arr = beams["BMAJ"] * 3600  # degrees -> arcsec
-            bmin_arr = beams["BMIN"] * 3600
-            bpa_arr  = beams["BPA"]
+                beams = hdul["BEAMS"]
+
+                def _column(name, unit, default):
+                    colunit = beams.columns[name].unit or default
+                    values = np.array(beams.data[name], dtype=float)
+                    return (values * units.Unit(colunit)).to_value(unit)
+
+                bmaj_arr = _column("BMAJ", "arcsec", "arcsec")
+                bmin_arr = _column("BMIN", "arcsec", "arcsec")
+                bpa_arr  = _column("BPA", "deg", "deg")
         except KeyError:
             bmaj_arr = np.array([hdr["BMAJ"] * 3600])
             bmin_arr = np.array([hdr["BMIN"] * 3600])
