@@ -1,7 +1,37 @@
 import re
 
 import numpy as np
+import scipy.fft
 import scipy.stats
+
+# -----------------------------------------------------------------------------
+# - Kernel on a grid of the given shape, with its peak at the origin
+# -----------------------------------------------------------------------------
+def _kernel_at_origin(kernel, shape):
+    kernel = kernel if kernel.ndim == 3 else kernel[None]
+    ny, nx = shape
+
+    grid = np.zeros((kernel.shape[0], ny, nx))
+    for c in range(kernel.shape[0]):
+        y0, x0 = np.unravel_index(np.argmax(kernel[c]), kernel[c].shape)
+        iy = np.arange(kernel.shape[1]) - y0
+        ix = np.arange(kernel.shape[2]) - x0
+        sy = (iy >= -(ny // 2)) & (iy < ny - ny // 2)
+        sx = (ix >= -(nx // 2)) & (ix < nx - nx // 2)
+        grid[c][np.ix_(iy[sy] % ny, ix[sx] % nx)] = kernel[c][np.ix_(sy, sx)]
+    return grid
+
+
+# -----------------------------------------------------------------------------
+# - Multiplicity of the rfft2 half-plane
+# -----------------------------------------------------------------------------
+def _rfft_pairs(nx):
+    pair = np.full(nx // 2 + 1, 2.00)
+    pair[0] = 1.00
+    if nx % 2 == 0:
+        pair[-1] = 1.00
+    return pair
+
 
 # -----------------------------------------------------------------------------
 # - Gaussian likelihood without correlation
@@ -55,10 +85,13 @@ class Normal:
 # - Radio-interferometric likelihood
 # -----------------------------------------------------------------------------
 class NormalRI:
-    def __init__(self, rms=None):
+    def __init__(self, rms=None, mode="full"):
+        if mode not in ["full", "fast"]:
+            raise ValueError("Invalid value for 'mode' argument. Please use 'full' or 'fast'.")
         self.rms = rms
+        self.mode = mode
 
-    def _build(self, data, **kwargs):
+    def _build(self, data, beam=None, **kwargs):
         nchans = data.shape[0]
 
         if self.rms is None:
@@ -77,8 +110,27 @@ class NormalRI:
             raise ValueError(
                 f"RMS has shape {self.rms.shape}, but it should be either a scalar or have shape ({nchans},)."
             )
- 
-        return {"rms": self.rms}
+
+        out = {"rms": self.rms}
+
+        if self.mode == "fast":
+            if beam is None:
+                raise ValueError("The 'fast' mode of 'NormalRI' requires a beam kernel.")
+
+            # Same zero-padded grid as the image-space convolution
+            _, ny, nx = data.shape
+            shape = tuple(
+                scipy.fft.next_fast_len(int(i + k - 1), real=True)
+                for i, k in zip((ny, nx), beam.shape[-2:])
+            )
+            beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
+
+            weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
+            out["ri_shape"] = shape
+            out["ri_quad"] = weight * _rfft_pairs(shape[1]) * beam_fft / (shape[0] * shape[1])
+            out["ri_data"] = weight * np.nan_to_num(data)
+
+        return out
 
     def _compute(self, theta):
         """Likelihood function for radio-interferometric measurements"""
@@ -87,10 +139,18 @@ class NormalRI:
         if not isinstance(model_out, tuple):
             return -np.inf
         model_clean, data, _ = model_out
-        model_dirty = self._smooth_model(model_clean)
 
-        log_like = model_clean * (model_dirty - 2.00 * data)
-        log_like = -0.50 * np.nansum(log_like / self.rms[:, None, None]**2)
+        if self._likelihood.mode == "fast":
+            # sum(m * (B * m)) from the model power, without inverse FFT
+            model_clean = np.nan_to_num(model_clean)
+            model_fft = np.fft.rfft2(model_clean, s=self.ri_shape, axes=(-2, -1))
+            log_like = np.sum(self.ri_quad * (model_fft.real**2 + model_fft.imag**2))
+            log_like = -0.50 * (log_like - 2.00 * np.sum(model_clean * self.ri_data))
+        else:
+            model_dirty = self._smooth_model(model_clean)
+
+            log_like = model_clean * (model_dirty - 2.00 * data)
+            log_like = -0.50 * np.nansum(log_like / self.rms[:, None, None]**2)
 
         log_norm = 0.00
 
@@ -114,25 +174,9 @@ class NormalFourier(NormalRI):
             raise ValueError("The 'NormalFourier' likelihood requires a beam kernel.")
 
         nchans, ny, nx = data.shape
-        kernel = np.broadcast_to(beam, (nchans,) + beam.shape[-2:])
-
-        # Kernel on the image grid, with its peak at the origin
-        grid = np.zeros((nchans, ny, nx))
-        for c in range(nchans):
-            y0, x0 = np.unravel_index(np.argmax(kernel[c]), kernel[c].shape)
-            iy = np.arange(kernel.shape[1]) - y0
-            ix = np.arange(kernel.shape[2]) - x0
-            sy = (iy >= -(ny // 2)) & (iy < ny - ny // 2)
-            sx = (ix >= -(nx // 2)) & (ix < nx - nx // 2)
-            grid[c][np.ix_(iy[sy] % ny, ix[sx] % nx)] = kernel[c][np.ix_(sy, sx)]
-
-        beam_fft = np.fft.rfft2(grid, axes=(-2, -1)).real
-
-        # Multiplicity of the rfft2 half-plane
-        pair = np.full(nx // 2 + 1, 2.00)
-        pair[0] = 1.00
-        if nx % 2 == 0:
-            pair[-1] = 1.00
+        beam_fft = np.fft.rfft2(_kernel_at_origin(beam, (ny, nx)), axes=(-2, -1)).real
+        beam_fft = np.broadcast_to(beam_fft, (nchans,) + beam_fft.shape[-2:])
+        pair = _rfft_pairs(nx)
 
         # Inverse variance of the Fourier pixels sampled by the beam
         keep = beam_fft > self.threshold * beam_fft.max(axis=(-2, -1), keepdims=True)
