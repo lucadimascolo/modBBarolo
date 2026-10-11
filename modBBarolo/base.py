@@ -809,8 +809,8 @@ class Sampler:
                 sampler_kwargs = {}
                 for key in inspect.signature(nautilus.Sampler).parameters.keys():
                     if key not in [
-                        "loglikelihood",
-                        "prior_transform",
+                        "prior",
+                        "likelihood",
                         "n_dim",
                         "n_live",
                         "filepath",
@@ -825,6 +825,11 @@ class Sampler:
                     if key not in ["verbose", "discard_exploration"]:
                         if key in kwargs:
                             run_kwargs[key] = kwargs.pop(key)
+
+                if kwargs:
+                    raise TypeError(
+                        f"Unrecognized arguments for method '{method}': {sorted(kwargs)}"
+                    )
 
                 filepath = f"{self.output}_checkpoint.h5" if checkpoint else None
 
@@ -867,10 +872,16 @@ class Sampler:
                             sampler_kwargs[key] = kwargs.pop(key)
 
                 run_kwargs = {}
-                for key in inspect.signature(emcee.EnsembleSampler.run_mcmc).parameters.keys():
-                    if key not in ["initial_state", "nsteps", "progress"]:
+                # run_mcmc only declares **kwargs, forwarded to sample()
+                for key in inspect.signature(emcee.EnsembleSampler.sample).parameters.keys():
+                    if key not in ["self", "initial_state", "iterations", "progress"]:
                         if key in kwargs:
                             run_kwargs[key] = kwargs.pop(key)
+
+                if kwargs:
+                    raise TypeError(
+                        f"Unrecognized arguments for method '{method}': {sorted(kwargs)}"
+                    )
 
                 if checkpoint:
                     backend = emcee.backends.HDFBackend(f"{self.output}_checkpoint_emcee.h5")
