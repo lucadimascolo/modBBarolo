@@ -34,6 +34,16 @@ def _rfft_pairs(nx):
 
 
 # -----------------------------------------------------------------------------
+# - Zero-padded grid of the image-space convolution
+# -----------------------------------------------------------------------------
+def _padded_shape(data, beam):
+    return tuple(
+        scipy.fft.next_fast_len(int(i + k - 1), real=True)
+        for i, k in zip(data.shape[-2:], beam.shape[-2:])
+    )
+
+
+# -----------------------------------------------------------------------------
 # - Gaussian likelihood without correlation
 # -----------------------------------------------------------------------------
 class Normal:
@@ -117,12 +127,7 @@ class NormalRI:
             if beam is None:
                 raise ValueError("The 'fast' mode of 'NormalRI' requires a beam kernel.")
 
-            # Same zero-padded grid as the image-space convolution
-            _, ny, nx = data.shape
-            shape = tuple(
-                scipy.fft.next_fast_len(int(i + k - 1), real=True)
-                for i, k in zip((ny, nx), beam.shape[-2:])
-            )
+            shape = _padded_shape(data, beam)
             beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
 
             weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
@@ -160,12 +165,12 @@ class NormalRI:
 
 
 # -----------------------------------------------------------------------------
-# - Radio-interferometric likelihood in Fourier space
+# - Radio-interferometric likelihood per Fourier cell
 # -----------------------------------------------------------------------------
 class NormalFourier(NormalRI):
-    def __init__(self, rms=None, threshold=1.00E-02):
+    def __init__(self, rms=None, filter=None):
         super().__init__(rms=rms)
-        self.threshold = threshold
+        self.filter = filter
 
     def _build(self, data, beam=None, **kwargs):
         out = super()._build(data, **kwargs)
@@ -173,33 +178,48 @@ class NormalFourier(NormalRI):
         if beam is None:
             raise ValueError("The 'NormalFourier' likelihood requires a beam kernel.")
 
-        nchans, ny, nx = data.shape
-        beam_fft = np.fft.rfft2(_kernel_at_origin(beam, (ny, nx)), axes=(-2, -1)).real
-        beam_fft = np.broadcast_to(beam_fft, (nchans,) + beam_fft.shape[-2:])
-        pair = _rfft_pairs(nx)
+        shape = _padded_shape(data, beam)
+        cells = (shape[0], shape[1] // 2 + 1)
+        beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
+        data_fft = np.fft.rfft2(np.nan_to_num(data), s=shape, axes=(-2, -1))
 
-        # Inverse variance of the Fourier pixels sampled by the beam
-        keep = beam_fft > self.threshold * beam_fft.max(axis=(-2, -1), keepdims=True)
-        icov = pair / (ny * nx * self.rms[:, None, None] ** 2 * np.where(keep, beam_fft, 1.00))
-        icov = np.where(keep, icov, 0.00)
+        # Spatial frequencies in cycles per pixel
+        ky, kx = np.meshgrid(np.fft.fftfreq(shape[0]), np.fft.rfftfreq(shape[1]), indexing="ij")
 
-        out["data_fft"] = np.fft.rfft2(np.nan_to_num(data), axes=(-2, -1))
-        out["beam_fft"] = beam_fft
-        out["icov"] = icov
+        if self.filter is None:
+            filt = np.ones(cells)
+        elif callable(self.filter):
+            filt = np.asarray(self.filter(ky, kx), dtype=float)
+        else:
+            filt = np.asarray(self.filter, dtype=float)
+
+        if filt.shape not in [cells, (data.shape[0],) + cells]:
+            raise ValueError(
+                f"Filter has shape {filt.shape}, but it should be {cells} or {(data.shape[0],) + cells}."
+            )
+
+        weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
+        weight = weight * filt * _rfft_pairs(shape[1]) / (shape[0] * shape[1])
+
+        out["rf_shape"] = shape
+        out["rf_freq"] = (ky, kx)
+        out["rf_filter"] = filt
+        out["rf_quad"] = weight * beam_fft
+        out["rf_cross"] = weight * np.conj(data_fft)
         return out
 
     def _compute(self, theta):
-        """Likelihood function for radio-interferometric measurements in Fourier space"""
+        """Likelihood function for radio-interferometric measurements per Fourier cell"""
 
         model_out = self._get_model(theta, convolve=False)
         if not isinstance(model_out, tuple):
             return -np.inf
         model, _, _ = model_out
 
-        model_fft = np.fft.rfft2(np.nan_to_num(model), axes=(-2, -1))
-        resid = self.data_fft - self.beam_fft * model_fft
+        model_fft = np.fft.rfft2(np.nan_to_num(model), s=self.rf_shape, axes=(-2, -1))
 
-        log_like = -0.50 * np.sum(self.icov * (resid.real ** 2 + resid.imag ** 2))
+        log_like = np.sum(self.rf_quad * (model_fft.real**2 + model_fft.imag**2))
+        log_like = -0.50 * (log_like - 2.00 * np.sum((self.rf_cross * model_fft).real))
 
         regularization = self._regularize_vdisp(theta, alpha=1.00)
 
