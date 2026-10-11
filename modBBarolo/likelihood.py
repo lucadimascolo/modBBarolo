@@ -137,10 +137,12 @@ class NormalRI:
             weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
             weight = weight * _rfft_pairs(shape[1]) / (shape[0] * shape[1])
 
-            keep = np.ones(beam_fft.shape, dtype=bool)
-            const = 0.00
+            out["fft_shape"] = shape
 
-            if self.mode == "full":
+            if self.mode == "fourier":
+                out["fft_quad"] = weight * beam_fft
+                out["fft_cross"] = weight * np.conj(data_fft)
+            else:
                 beam_max = beam_fft.max(axis=(-2, -1), keepdims=True)
                 threshold = self.threshold
 
@@ -151,20 +153,15 @@ class NormalRI:
                     ring = np.sqrt(ring / np.maximum(neg.sum(axis=(-2, -1), keepdims=True), 1))
                     threshold = 3.00 * ring / beam_max
 
+                # Inverse variance of the Fourier cells sampled by the beam
                 keep = beam_fft > threshold * beam_max
-                weight = weight * keep
-
-                # Data term of the chi-square on the kept cells
-                const = np.abs(data_fft) ** 2 / np.where(keep, beam_fft, 1.00)
-                const = -0.50 * np.sum(weight * const)
+                icov = np.where(keep, weight / np.where(keep, beam_fft, 1.00), 0.00)
 
                 out["fft_threshold"] = threshold
-
-            out["fft_shape"] = shape
-            out["fft_keep"] = keep
-            out["fft_quad"] = weight * beam_fft
-            out["fft_cross"] = weight * np.conj(data_fft)
-            out["fft_const"] = const
+                out["fft_keep"] = keep
+                out["data_fft"] = data_fft
+                out["beam_fft"] = beam_fft
+                out["icov"] = icov
 
         return out
 
@@ -184,9 +181,12 @@ class NormalRI:
         else:
             model_fft = np.fft.rfft2(np.nan_to_num(model_clean), s=self.fft_shape, axes=(-2, -1))
 
-            log_like = np.sum(self.fft_quad * (model_fft.real**2 + model_fft.imag**2))
-            log_like = log_like - 2.00 * np.sum((self.fft_cross * model_fft).real)
-            log_like = -0.50 * log_like + self.fft_const
+            if self._likelihood.mode == "fourier":
+                log_like = np.sum(self.fft_quad * (model_fft.real**2 + model_fft.imag**2))
+                log_like = -0.50 * (log_like - 2.00 * np.sum((self.fft_cross * model_fft).real))
+            else:
+                resid = self.data_fft - self.beam_fft * model_fft
+                log_like = -0.50 * np.sum(self.icov * (resid.real**2 + resid.imag**2))
 
         log_norm = 0.00
 
