@@ -95,11 +95,14 @@ class Normal:
 # - Radio-interferometric likelihood
 # -----------------------------------------------------------------------------
 class NormalRI:
-    def __init__(self, rms=None, mode="full"):
-        if mode not in ["full", "fast"]:
-            raise ValueError("Invalid value for 'mode' argument. Please use 'full' or 'fast'.")
+    def __init__(self, rms=None, mode="image", threshold="auto"):
+        if mode not in ["image", "fourier", "full"]:
+            raise ValueError("Invalid value for 'mode' argument. Please use 'image', 'fourier' or 'full'.")
+        if threshold is None or (isinstance(threshold, str) and threshold != "auto"):
+            raise ValueError("Invalid value for 'threshold' argument. Please use 'auto' or a number.")
         self.rms = rms
         self.mode = mode
+        self.threshold = threshold
 
     def _build(self, data, beam=None, **kwargs):
         nchans = data.shape[0]
@@ -123,17 +126,45 @@ class NormalRI:
 
         out = {"rms": self.rms}
 
-        if self.mode == "fast":
+        if self.mode != "image":
             if beam is None:
-                raise ValueError("The 'fast' mode of 'NormalRI' requires a beam kernel.")
+                raise ValueError(f"The '{self.mode}' mode of 'NormalRI' requires a beam kernel.")
 
             shape = _padded_shape(data, beam)
             beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
+            data_fft = np.fft.rfft2(np.nan_to_num(data), s=shape, axes=(-2, -1))
 
             weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
-            out["ri_shape"] = shape
-            out["ri_quad"] = weight * _rfft_pairs(shape[1]) * beam_fft / (shape[0] * shape[1])
-            out["ri_data"] = weight * np.nan_to_num(data)
+            weight = weight * _rfft_pairs(shape[1]) / (shape[0] * shape[1])
+
+            keep = np.ones(beam_fft.shape, dtype=bool)
+            const = 0.00
+
+            if self.mode == "full":
+                beam_max = beam_fft.max(axis=(-2, -1), keepdims=True)
+                threshold = self.threshold
+
+                # Ringing level from the negative cells, in units of the maximum
+                if threshold == "auto":
+                    neg = beam_fft < 0
+                    ring = np.sum(np.where(neg, beam_fft, 0.00) ** 2, axis=(-2, -1), keepdims=True)
+                    ring = np.sqrt(ring / np.maximum(neg.sum(axis=(-2, -1), keepdims=True), 1))
+                    threshold = 3.00 * ring / beam_max
+
+                keep = beam_fft > threshold * beam_max
+                weight = weight * keep
+
+                # Data term of the chi-square on the kept cells
+                const = np.abs(data_fft) ** 2 / np.where(keep, beam_fft, 1.00)
+                const = -0.50 * np.sum(weight * const)
+
+                out["fft_threshold"] = threshold
+
+            out["fft_shape"] = shape
+            out["fft_keep"] = keep
+            out["fft_quad"] = weight * beam_fft
+            out["fft_cross"] = weight * np.conj(data_fft)
+            out["fft_const"] = const
 
         return out
 
@@ -145,67 +176,20 @@ class NormalRI:
             return -np.inf
         model_clean, data, _ = model_out
 
-        if self._likelihood.mode == "fast":
-            # sum(m * (B * m)) from the model power, without inverse FFT
-            model_clean = np.nan_to_num(model_clean)
-            model_fft = np.fft.rfft2(model_clean, s=self.ri_shape, axes=(-2, -1))
-            log_like = np.sum(self.ri_quad * (model_fft.real**2 + model_fft.imag**2))
-            log_like = -0.50 * (log_like - 2.00 * np.sum(model_clean * self.ri_data))
-        else:
+        if self._likelihood.mode == "image":
             model_dirty = self._smooth_model(model_clean)
 
             log_like = model_clean * (model_dirty - 2.00 * data)
             log_like = -0.50 * np.nansum(log_like / self.rms[:, None, None]**2)
+        else:
+            model_fft = np.fft.rfft2(np.nan_to_num(model_clean), s=self.fft_shape, axes=(-2, -1))
+
+            log_like = np.sum(self.fft_quad * (model_fft.real**2 + model_fft.imag**2))
+            log_like = log_like - 2.00 * np.sum((self.fft_cross * model_fft).real)
+            log_like = -0.50 * log_like + self.fft_const
 
         log_norm = 0.00
 
         regularization = self._regularize_vdisp(theta, alpha=1.00)
         
         return log_like + log_norm + regularization
-
-
-# -----------------------------------------------------------------------------
-# - Radio-interferometric likelihood in Fourier space
-# -----------------------------------------------------------------------------
-class NormalFourier(NormalRI):
-    def __init__(self, rms=None, threshold=1.00E-02):
-        super().__init__(rms=rms)
-        self.threshold = threshold
-
-    def _build(self, data, beam=None, **kwargs):
-        out = super()._build(data, **kwargs)
-
-        if beam is None:
-            raise ValueError("The 'NormalFourier' likelihood requires a beam kernel.")
-
-        shape = _padded_shape(data, beam)
-        beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
-        data_fft = np.fft.rfft2(np.nan_to_num(data), s=shape, axes=(-2, -1))
-
-        # Inverse variance of the Fourier cells sampled by the beam
-        keep = beam_fft > self.threshold * beam_fft.max(axis=(-2, -1), keepdims=True)
-        icov = np.nan_to_num(1.00 / self.rms**2)[:, None, None] * _rfft_pairs(shape[1])
-        icov = np.where(keep, icov / (shape[0] * shape[1] * np.where(keep, beam_fft, 1.00)), 0.00)
-
-        out["fft_shape"] = shape
-        out["data_fft"] = data_fft
-        out["beam_fft"] = beam_fft
-        out["icov"] = icov
-        return out
-
-    def _compute(self, theta):
-        """Likelihood function for radio-interferometric measurements in Fourier space"""
-
-        model_out = self._get_model(theta, convolve=False)
-        if not isinstance(model_out, tuple):
-            return -np.inf
-        model, _, _ = model_out
-
-        model_fft = np.fft.rfft2(np.nan_to_num(model), s=self.fft_shape, axes=(-2, -1))
-        resid = self.data_fft - self.beam_fft * model_fft
-
-        log_like = -0.50 * np.sum(self.icov * (resid.real**2 + resid.imag**2))
-
-        regularization = self._regularize_vdisp(theta, alpha=1.00)
-
-        return log_like + regularization
