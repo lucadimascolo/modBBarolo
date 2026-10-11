@@ -168,9 +168,10 @@ class NormalRI:
 # - Radio-interferometric likelihood per Fourier cell
 # -----------------------------------------------------------------------------
 class NormalFourier(NormalRI):
-    def __init__(self, rms=None, filter=None):
+    def __init__(self, rms=None, filter=None, threshold=None):
         super().__init__(rms=rms)
         self.filter = filter
+        self.threshold = threshold
 
     def _build(self, data, beam=None, **kwargs):
         out = super()._build(data, **kwargs)
@@ -198,14 +199,26 @@ class NormalFourier(NormalRI):
                 f"Filter has shape {filt.shape}, but it should be {cells} or {(data.shape[0],) + cells}."
             )
 
+        # Truncated inverse: keep the cells sampled by the beam
+        if self.threshold is not None:
+            keep = beam_fft > self.threshold * beam_fft.max(axis=(-2, -1), keepdims=True)
+            filt = filt * keep
+
         weight = np.nan_to_num(1.00 / self.rms**2)[:, None, None]
         weight = weight * filt * _rfft_pairs(shape[1]) / (shape[0] * shape[1])
+
+        # Data term of the chi-square, defined on the kept cells only
+        const = 0.00
+        if self.threshold is not None:
+            const = np.abs(data_fft) ** 2 / np.where(keep, beam_fft, 1.00)
+            const = -0.50 * np.sum(weight * const)
 
         out["rf_shape"] = shape
         out["rf_freq"] = (ky, kx)
         out["rf_filter"] = filt
         out["rf_quad"] = weight * beam_fft
         out["rf_cross"] = weight * np.conj(data_fft)
+        out["rf_const"] = const
         return out
 
     def _compute(self, theta):
@@ -223,4 +236,4 @@ class NormalFourier(NormalRI):
 
         regularization = self._regularize_vdisp(theta, alpha=1.00)
 
-        return log_like + regularization
+        return log_like + self.rf_const + regularization
