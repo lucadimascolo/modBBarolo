@@ -417,7 +417,7 @@ class Sampler:
         # If the user set priors["vdisp"]["name"] == "sqrt", vdisp is
         # sampled uniform in vdisp^2 over the given [loc, loc+scale] bounds.
         self._vdisp_sqrt = (
-            any(p.split("_")[0] == "vdisp" for p in free_params)
+            any(p in ("vdisp", "vdisp_single") for p in free_params)
             and self.bbobj.priors["vdisp"]["name"] == "sqrt"
         )
         if self._vdisp_sqrt:
@@ -467,6 +467,7 @@ class Sampler:
 
         self.freepar_names = list(self.bbobj.freepar_names)
         self.freepar_idx = dict(self.bbobj.freepar_idx)
+        self._func_params = sorted({k.split("_p")[0] for k in self.freepar_idx if "_p" in k})
         self.prior_distr = dict(self.bbobj.prior_distr)
 
         if self._vdisp_constrained:
@@ -710,7 +711,7 @@ class Sampler:
         theta = self._physical_theta(theta)
 
         for k in self.freepar_idx:
-            if k.startswith(is_positive) and np.any(theta[self.freepar_idx[k]] < 0):
+            if k in is_positive and np.any(theta[self.freepar_idx[k]] < 0):
                 return -np.inf
 
         if self._fit_rsep:
@@ -725,6 +726,11 @@ class Sampler:
             self.bbobj._inri.modify_parameter("radii", new_radii)
 
         rings = self.bbobj._update_rings(self.bbobj._inri, theta)
+
+        # Functional forms: check the ring values they produce
+        for k in self._func_params:
+            if k in is_positive and np.any(rings.r[k] < 0):
+                return -np.inf
 
         if self.bbobj.update_prof:
             self.bbobj._update_profile(rings)
