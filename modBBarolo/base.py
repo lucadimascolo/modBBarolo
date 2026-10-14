@@ -976,6 +976,18 @@ class Sampler:
 
         return model, self.data, self.bbobj.mask
 
+    # -----------------------------------------------------------------------------
+    # - Build the likelihood and bind it to the sampler
+    # -----------------------------------------------------------------------------
+    def _setup_likelihood(self, **likelihood_kwargs):
+        if "beam" in likelihood_kwargs:
+            raise ValueError("'beam' cannot be passed in 'likelihood_kwargs': the kernel comes from the Init object.")
+        likelihood_built = self._likelihood._build(
+            self.data, beam=self.bbobj._beam_kernel, **likelihood_kwargs
+        )
+        for key, value in likelihood_built.items():
+            setattr(self, key, value)
+        self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
 
 
     # -----------------------------------------------------------------------------
@@ -988,12 +1000,7 @@ class Sampler:
         if method not in _methods:
             raise ValueError(f"Method {method} not recognized. Please use one of: {_methods}")
 
-        likelihood_built = self._likelihood._build(
-            self.data, beam=self.bbobj._beam_kernel, **likelihood_kwargs
-        )
-        for key, value in likelihood_built.items():
-            setattr(self, key, value)
-        self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
+        self._setup_likelihood(**likelihood_kwargs)
 
         global _active_sampler
         _active_sampler = self
