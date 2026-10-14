@@ -581,6 +581,11 @@ class Sampler:
                     "The 'constrained' vdisp prior mode requires the bare 'vdisp' "
                     "free parameter (one value per ring), not 'vdisp_single'/'vdisp_func'."
                 )
+            if "radmax" in free_params:
+                raise ValueError(
+                    "'radmax' cannot be free with the 'constrained' vdisp prior mode: "
+                    "the random-walk steps are scaled to the initial ring grid."
+                )
             self.bbobj.prior_distr["vdisp"] = get_distribution("norm", loc=0.00, scale=1.00)
 
         self.bbobj._opts.add_params(sm=False)
@@ -620,12 +625,6 @@ class Sampler:
         self.freepar_idx = dict(self.bbobj.freepar_idx)
         self._func_params = sorted({k.split("_p")[0] for k in self.freepar_idx if "_p" in k})
         self.prior_distr = dict(self.bbobj.prior_distr)
-
-        if self._vdisp_constrained:
-            # These entries hold z-space innovations, not physical vdisp;
-            # relabel so corner plots / percentiles don't read as physical.
-            for i in self.freepar_idx["vdisp"]:
-                self.freepar_names[i] = f"z_{self.freepar_names[i]}"
 
         if self._fit_rsep:
             self.freepar_names.append("rsep")
@@ -694,6 +693,33 @@ class Sampler:
                 self.prior_distr[pname] = get_distribution(
                     self.bbobj.priors[pname]["name"], **distr_kwargs
                 )
+
+        # Physical layout, as seen by _update_rings and the rest of the model
+        self._phys_idx = self.freepar_idx
+        self._phys_names = list(self.freepar_names)
+
+        if self._vdisp_constrained:
+            # vdisp_1 = vdisp_mu: the first ring has no innovation of its own
+            first = int(self.freepar_idx["vdisp"][0])
+            self._phys_idx = dict(self.freepar_idx)
+
+            self.freepar_idx = {}
+            for key, value in self._phys_idx.items():
+                value = np.asarray(value)
+                if key == "vdisp":
+                    value = value[1:]
+                value = np.where(value > first, value - 1, value)
+                self.freepar_idx[key] = value if value.ndim else int(value)
+
+            innovations = set(int(i) for i in self._phys_idx["vdisp"][1:])
+            self.freepar_names = [
+                f"z_{name}" if i in innovations else name
+                for i, name in enumerate(self._phys_names) if i != first
+            ]
+
+            # Random-walk variance proportional to the radial step
+            steps = np.diff(np.asarray(self.bbobj.radii, dtype=np.float64))
+            self._walk_weight = np.sqrt(steps / steps.max())
 
         self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
 
@@ -888,18 +914,28 @@ class Sampler:
     # - Map z-space vdisp (constrained mode) to physical per-ring vdisp
     # -----------------------------------------------------------------------------
     def _physical_theta(self, theta):
-        """Return theta with the 'vdisp' slice mapped from z-space to physical
-        values (vdisp_i = vdisp_mu + tau * cumsum(z)_i) when the 'constrained'
-        vdisp prior mode is active; otherwise returns theta unchanged."""
+        """Map sampled vectors (last axis) to the physical layout. In the 'constrained'
+        vdisp mode vdisp_1 = vdisp_mu and vdisp_i = vdisp_mu + tau * sum_{j<=i} w_j z_j,
+        with w_j the square root of the radial step in units of the largest one."""
         if not self._vdisp_constrained:
             return theta
-        theta = np.array(theta, copy=True)
-        idx = self.freepar_idx["vdisp"]
-        z = theta[idx]
-        mu = theta[self.freepar_idx["vdisp_mu"]]
-        tau = theta[self.freepar_idx["tau"]]
-        theta[idx] = mu + tau * np.cumsum(z)
-        return theta
+        theta = np.asarray(theta, dtype=np.float64)
+        phys = np.insert(theta, int(self._phys_idx["vdisp"][0]), 0.00, axis=-1)
+
+        z = theta[..., self.freepar_idx["vdisp"]] * self._walk_weight
+        mu = theta[..., self.freepar_idx["vdisp_mu"], None]
+        tau = theta[..., self.freepar_idx["tau"], None]
+        steps = np.concatenate([np.zeros(z.shape[:-1] + (1,)), z], axis=-1)
+        phys[..., self._phys_idx["vdisp"]] = mu + tau * np.cumsum(steps, axis=-1)
+        return phys
+
+    # -----------------------------------------------------------------------------
+    # - Ring radii for a given separation, as built by Init.initialize()
+    # -----------------------------------------------------------------------------
+    def _radii(self, rsep):
+        nr = len(self.bbobj.radii) - int(self.bbobj._add_zero)
+        radii = np.linspace(0.50 * rsep, 0.50 * rsep * (1.00 + 2.00 * (nr - 1.00)), nr)
+        return np.concatenate([[0.00], radii]) if self.bbobj._add_zero else radii
 
     # -----------------------------------------------------------------------------
     # - Build BBarolo model and data+mask for likelihood
@@ -907,22 +943,16 @@ class Sampler:
     def _get_model(self, theta, convolve=False):
         theta = self._physical_theta(theta)
 
-        for k in self.freepar_idx:
-            if k in is_positive and np.any(theta[self.freepar_idx[k]] < 0):
+        idx = self._phys_idx
+        for k in idx:
+            if k in is_positive and np.any(theta[idx[k]] < 0):
                 return -np.inf
 
         if self._fit_rsep:
-            rsep_val = theta[self.freepar_idx["rsep"]]
-            nr_total = len(self.bbobj.radii)
-            nr_kin = nr_total - 1 if self.bbobj._add_zero else nr_total
-            new_radii = np.linspace(
-                0.50 * rsep_val, 0.50 * rsep_val * (1.00 + 2.00 * (nr_kin - 1.00)), nr_kin
-            )
+            rsep_val = theta[idx["rsep"]]
             if 0.50 * rsep_val <= self.bbobj._min_node_sep:
                 return -np.inf
-            if self.bbobj._add_zero:
-                new_radii = np.concatenate([[0.0], new_radii])
-            self.bbobj._inri.modify_parameter("radii", new_radii)
+            self.bbobj._inri.modify_parameter("radii", self._radii(rsep_val))
 
         rings = self.bbobj._update_rings(self.bbobj._inri, theta)
 
@@ -948,10 +978,10 @@ class Sampler:
         try:
             kwargs = {}
             if self.method_norm == "constant":
-                kwargs["norm"] = theta[self.freepar_idx["norm"]]
+                kwargs["norm"] = theta[idx["norm"]]
             elif self.method_norm == "exponential":
-                kwargs["norm"] = theta[self.freepar_idx["norm"]]
-                kwargs["rdisk"] = theta[self.freepar_idx["rdisk"]]
+                kwargs["norm"] = theta[idx["norm"]]
+                kwargs["rdisk"] = theta[idx["rdisk"]]
                 kwargs["rings"] = rings
                 kwargs["bhi"], kwargs["blo"] = bhi, blo
             else:
@@ -1186,14 +1216,15 @@ class Sampler:
 
         if self._vdisp_constrained:
             # z values mapping onto the median physical vdisp
-            idx = self.freepar_idx["vdisp"]
-            mu = self.samples[:, self.freepar_idx["vdisp_mu"]]
-            tau = self.samples[:, self.freepar_idx["tau"]]
-            vdisp = mu[:, None] + tau[:, None] * np.cumsum(self.samples[:, idx], axis=1)
+            vdisp = self._physical_theta(self.samples)[:, self._phys_idx["vdisp"]]
             vdisp = np.array([corner.quantile(v, 0.50, weights=self.weights)[0] for v in vdisp.T])
 
-            mu, tau = self.params[self.freepar_idx["vdisp_mu"]], self.params[self.freepar_idx["tau"]]
-            self.params[idx] = np.diff(vdisp, prepend=mu) / tau if tau > 0.00 else 0.00
+            # vdisp_1 = vdisp_mu, so its median is already the median of vdisp_mu
+            tau = self.params[self.freepar_idx["tau"]]
+            self.params[self.freepar_idx["vdisp_mu"]] = vdisp[0]
+            self.params[self.freepar_idx["vdisp"]] = (
+                np.diff(vdisp) / (tau * self._walk_weight) if tau > 0.00 else 0.00
+            )
 
         self.bbobj.params = self._physical_theta(self.params)[: len(self.bbobj.freepar_names)]
         self.bbobj.modCalculated = True
@@ -1212,38 +1243,10 @@ class Sampler:
         if not use_physical_params:
             return self.samples, self.freepar_names
 
-        idx_vdisp = np.atleast_1d(self.freepar_idx["vdisp"])
-        idx_mu = int(self.freepar_idx["vdisp_mu"])
-        idx_tau = int(self.freepar_idx["tau"])
-
-        z = self.samples[:, idx_vdisp]
-        mu = self.samples[:, idx_mu]
-        tau = self.samples[:, idx_tau]
-        vdisp_physical = mu[:, None] + tau[:, None] * np.cumsum(z, axis=1)
-
-        vdisp_names = [
-            name[2:] if name.startswith("z_") else name
-            for name in (self.freepar_names[i] for i in idx_vdisp)
-        ]
-
-        drop = set(idx_vdisp.tolist()) | {idx_mu, idx_tau}
-        first_vdisp = int(idx_vdisp[0])
-
-        samples_cols, names, inserted = [], [], False
-        for i, name in enumerate(self.freepar_names):
-            if i in drop:
-                if not inserted and i >= first_vdisp:
-                    samples_cols.append(vdisp_physical)
-                    names.extend(vdisp_names)
-                    inserted = True
-                continue
-            samples_cols.append(self.samples[:, i : i + 1])
-            names.append(name)
-        if not inserted:
-            samples_cols.append(vdisp_physical)
-            names.extend(vdisp_names)
-
-        return np.concatenate(samples_cols, axis=1), names
+        # Physical layout; vdisp_mu is dropped since it equals vdisp1
+        samples = self._physical_theta(self.samples)
+        keep = [i for i in range(len(self._phys_names)) if i != self._phys_idx["vdisp_mu"]]
+        return samples[:, keep], [self._phys_names[i] for i in keep]
 
     # -----------------------------------------------------------------------------
     # - Save corner plot
