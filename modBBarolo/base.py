@@ -544,6 +544,16 @@ class Sampler:
         if self.bbobj.mask is None:
             self.bbobj.mask = np.ones_like(self.bbobj.data, dtype=bool)
 
+        # BBarolo reads blanked voxels as zeros: restore them for the likelihood
+        self.data = self.bbobj.data
+        with fits.open(self.bbobj.inp.fname) as hdu:
+            raw = np.squeeze(hdu[0].data)
+        if raw.shape != self.data.shape:
+            print("Warning. Cannot match the FITS data to BBarolo's cube: blanked voxels are kept as zeros.")
+        elif not np.all(np.isfinite(raw)):
+            self.data = np.where(np.isfinite(raw), self.data, np.nan)
+        del raw
+
         self.moment_zero = moment_zero
         self.moment_zero_data = np.nansum(self.bbobj.data * self.bbobj.mask, axis=0)
 
@@ -832,7 +842,7 @@ class Sampler:
 
         # Extract mask and data arrays
         mask = self.bbobj.mask
-        data = self.bbobj.data
+        data = self.data
 
         mask_ = mask[:, blo[1] : bhi[1], blo[0] : bhi[0]]
         data_ = data[:, blo[1] : bhi[1], blo[0] : bhi[0]]
@@ -880,7 +890,7 @@ class Sampler:
             raise ValueError(f"Method {method} not recognized. Please use one of: {_methods}")
 
         likelihood_built = self._likelihood._build(
-            self.bbobj.data, beam=self.bbobj._beam_kernel, **likelihood_kwargs
+            self.data, beam=self.bbobj._beam_kernel, **likelihood_kwargs
         )
         for key, value in likelihood_built.items():
             setattr(self, key, value)

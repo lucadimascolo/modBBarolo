@@ -70,7 +70,10 @@ class Normal:
                 f"RMS has shape {self.rms.shape}, but it should be either a scalar or have shape ({nchans},)."
             )
  
-        return {"rms": self.rms}
+        # Blanked voxels do not enter the likelihood
+        nvalid = np.isfinite(data).sum(axis=(-2, -1))
+
+        return {"rms": self.rms, "nvalid": nvalid}
 
     def _compute(self, theta):
         """Likelihood function for Gaussian noise without correlation."""
@@ -84,7 +87,7 @@ class Normal:
         log_like = -0.50 * np.nansum(log_like ** 2)
 
         log_norm = np.log(2.00 * np.pi * self.rms**2)
-        log_norm = -0.50 * np.nansum(log_norm * data.shape[1] * data.shape[2])
+        log_norm = -0.50 * np.nansum(log_norm * self.nvalid)
 
         regularization = self._regularize_vdisp(theta, alpha=1.00)
         
