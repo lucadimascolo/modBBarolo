@@ -129,9 +129,10 @@ class NormalRI:
 
         out = {"rms": self.rms}
 
+        if beam is None:
+            raise ValueError(f"The '{self.mode}' mode of 'NormalRI' requires a beam kernel.")
+
         if self.mode != "image":
-            if beam is None:
-                raise ValueError(f"The '{self.mode}' mode of 'NormalRI' requires a beam kernel.")
 
             shape = _padded_shape(data, beam)
             beam_fft = np.fft.rfft2(_kernel_at_origin(beam, shape), axes=(-2, -1)).real
