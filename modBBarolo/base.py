@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 
 from pyBBarolo.bayesian import get_distribution
 from pyBBarolo.bayesian import libBB, ctypes, reshapePointer
-from pyBBarolo.bayesian import BayesianBBarolo
+from pyBBarolo.bayesian import BayesianBBarolo, Rings
 
 import nautilus
 import emcee
@@ -58,6 +58,14 @@ class Init(BayesianBBarolo):
 
         self._add_zero = False
         self._cdens_boost = None
+        self._pad_rings = None
+
+        # Galmod needs ring nodes more than 0.75 pixels apart
+        try:
+            hdr = fits.getheader(fitsname)
+            self._min_node_sep = 0.75 * 3600 * min(abs(hdr["CDELT1"]), abs(hdr["CDELT2"]))
+        except KeyError:
+            self._min_node_sep = 0.00
         self._vrot_r0_removed_idx = None
         self._full_freepar_idx = None
 
@@ -86,6 +94,11 @@ class Init(BayesianBBarolo):
 
         if len(self.radii) < 2:
             raise ValueError("At least two rings are required: use rnum >= 2 or add_zero=True.")
+
+        if 0.50 * rsep <= self._min_node_sep:
+            raise ValueError(
+                f"'rsep' must be larger than {2.00 * self._min_node_sep:.4g} arcsec (1.5 pixels)."
+            )
 
         init = dict(init)
 
@@ -149,23 +162,54 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
-    # - Guard against BBarolo's finalModel=True ring-state leak
+    # - Rings handed to Galmod, with explicit nodes at the model edges
+    # -------------------------------------------------------------------------
+    def _padded_rings(self, rings):
+        radii = np.asarray(rings.r["radii"], dtype=np.float64)
+
+        # Ring centres sit at odd multiples of rsep/2
+        inner = radii[0] > 0.00
+        rsep = 2.00 * (radii[0] if inner else radii[1])
+
+        def pad(values):
+            values = np.asarray(values)
+            return np.concatenate([values[:1] if inner else values[:0], values, values[-1:]])
+
+        padded = {key: pad(values) for key, values in rings.r.items()}
+        padded["radii"] = np.concatenate(
+            [[0.00] if inner else [], radii, [radii[-1] + 0.50 * rsep]]
+        )
+
+        if self._pad_rings is None or self._pad_rings.nr != len(padded["radii"]):
+            self._pad_rings = Rings(len(padded["radii"]))
+        for key, values in padded.items():
+            self._pad_rings.modify_parameter(key, values)
+        self._pad_rings.make_object()
+
+        return self._pad_rings
+
+
+    # -------------------------------------------------------------------------
+    # - Render the rings with their values at the nominal radii
     # -------------------------------------------------------------------------
     def _render_model(self, rings, fullcube=False):
-        radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
+        # finalModel=False: BBarolo would otherwise shift the first and last ring
+        padded = self._padded_rings(rings)
 
-        kwargs = {}
-        if "fullcube" in inspect.signature(super()._calculate_model).parameters:
-            kwargs["fullcube"] = fullcube
-        elif fullcube:
-            raise TypeError(
-                "installed pyBBarolo's _calculate_model() does not support fullcube"
-            )
+        _, ys, xs = self.data.shape
+        if fullcube:
+            bhi, blo = (ctypes.c_int * 2)(xs, ys), (ctypes.c_int * 2)(0, 0)
+        else:
+            bhi, blo = (ctypes.c_int * 2)(0, 0), (ctypes.c_int * 2)(0, 0)
+            libBB.Galfit_getModelSize(self._galfit, padded._rings, bhi, blo)
 
-        try:
-            return super()._calculate_model(rings, **kwargs)
-        finally:
-            rings.modify_parameter("radii", radii_saved)
+        galmod = libBB.Galfit_getModel(self._galfit, padded._rings, bhi, blo, False)
+        bhi, blo = np.array(bhi), np.array(blo)
+
+        shape = (self.inp.dim[2], bhi[1] - blo[1], bhi[0] - blo[0])
+        mod = reshapePointer(libBB.Galmod_array(galmod), shape)
+
+        return mod, bhi, blo, galmod
 
 
     # -------------------------------------------------------------------------
@@ -721,6 +765,8 @@ class Sampler:
             new_radii = np.linspace(
                 0.50 * rsep_val, 0.50 * rsep_val * (1.00 + 2.00 * (nr_kin - 1.00)), nr_kin
             )
+            if 0.50 * rsep_val <= self.bbobj._min_node_sep:
+                return -np.inf
             if self.bbobj._add_zero:
                 new_radii = np.concatenate([[0.0], new_radii])
             self.bbobj._inri.modify_parameter("radii", new_radii)
@@ -1098,9 +1144,7 @@ class Sampler:
         bhi = (ctypes.c_int * 2)(xs, ys)
         blo = (ctypes.c_int * 2)(0, 0)
 
-        radii_saved = np.array(rings.r["radii"], dtype=np.float32, copy=True)
-        galmod = libBB.Galfit_getModel(self.bbobj._galfit, rings._rings, bhi, blo, True)
-        rings.modify_parameter("radii", radii_saved)
+        _, _, _, galmod = self.bbobj._render_model(rings, fullcube=True)
 
         buffer = reshapePointer(libBB.Galmod_array(galmod), model.shape)
         buffer[:] = model
