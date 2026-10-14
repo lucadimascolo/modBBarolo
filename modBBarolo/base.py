@@ -1242,6 +1242,10 @@ class Sampler:
         self.bbobj.params = self._physical_theta(self.params)[: len(self.bbobj.freepar_names)]
         self.bbobj.modCalculated = True
 
+        if self._fit_rsep:
+            self.bbobj.rsep = float(self.params[self.freepar_idx["rsep"]])
+            self.bbobj.radii = self._radii(self.bbobj.rsep)
+
         self.log_l_median = self._log_likelihood(self.params)
         print(
             f"Log-likelihood at the median parameters: {self.log_l_median:.2f}; "
@@ -1386,3 +1390,7 @@ class Sampler:
         )
         libBB.Galmod_delete(galmod)
         plt.close()
+
+        # Leave the ring grid at the median, as bbobj.rsep and bbobj.radii
+        if self._fit_rsep:
+            self.bbobj._inri.modify_parameter("radii", self.bbobj.radii, makeobj=True)
