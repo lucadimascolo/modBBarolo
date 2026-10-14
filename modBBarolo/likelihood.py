@@ -44,6 +44,40 @@ def _padded_shape(data, beam):
 
 
 # -----------------------------------------------------------------------------
+# - Per-channel rms, with unusable channels set to NaN
+# -----------------------------------------------------------------------------
+def _channel_rms(data, rms):
+    nchans = data.shape[0]
+
+    if rms is None:
+        print(
+            "Calculating RMS from data. If you want to set it manually, "
+            "assign a value to 'self.rms' before running the sampler."
+        )
+
+        rms = scipy.stats.median_abs_deviation(
+            data, scale="normal", axis=(-2, -1), nan_policy="omit"
+        )
+
+    try:
+        rms = np.broadcast_to(rms, (nchans,)).astype(np.float64)
+    except ValueError:
+        raise ValueError(
+            f"RMS has shape {np.shape(rms)}, but it should be either a scalar or have shape ({nchans},)."
+        )
+
+    # A zero or non-finite rms would make the likelihood non-finite
+    bad = ~(np.isfinite(rms) & (rms > 0.00))
+    if np.all(bad):
+        raise ValueError("No channel has a valid RMS: the likelihood cannot be computed.")
+    if np.any(bad):
+        print(f"Warning. {bad.sum()} of {nchans} channels have no valid RMS and are left out of the likelihood.")
+        rms[bad] = np.nan
+
+    return rms
+
+
+# -----------------------------------------------------------------------------
 # - Gaussian likelihood without correlation
 # -----------------------------------------------------------------------------
 class Normal:
@@ -51,24 +85,7 @@ class Normal:
         self.rms = rms
 
     def _build(self, data, **kwargs):
-        nchans = data.shape[0]
-
-        if self.rms is None:
-            print(
-                "Calculating RMS from data. If you want to set it manually, "
-                "assign a value to 'self.rms' before running the sampler."
-            )
-
-            self.rms = scipy.stats.median_abs_deviation(
-                data, scale="normal", axis=(-2, -1), nan_policy="omit"
-            )
-
-        try:
-            self.rms = np.broadcast_to(self.rms, (nchans,)).copy()
-        except ValueError:
-            raise ValueError(
-                f"RMS has shape {self.rms.shape}, but it should be either a scalar or have shape ({nchans},)."
-            )
+        self.rms = _channel_rms(data, self.rms)
  
         # Blanked voxels do not enter the likelihood
         nvalid = np.isfinite(data).sum(axis=(-2, -1))
@@ -108,24 +125,7 @@ class NormalRI:
         self.threshold = threshold
 
     def _build(self, data, beam=None, **kwargs):
-        nchans = data.shape[0]
-
-        if self.rms is None:
-            print(
-                "Calculating RMS from data. If you want to set it manually, "
-                "assign a value to 'self.rms' before running the sampler."
-            )
-
-            self.rms = scipy.stats.median_abs_deviation(
-                data, scale="normal", axis=(-2, -1), nan_policy="omit"
-            )
-
-        try:
-            self.rms = np.broadcast_to(self.rms, (nchans,)).copy()
-        except ValueError:
-            raise ValueError(
-                f"RMS has shape {self.rms.shape}, but it should be either a scalar or have shape ({nchans},)."
-            )
+        self.rms = _channel_rms(data, self.rms)
 
         out = {"rms": self.rms}
 
