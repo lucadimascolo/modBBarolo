@@ -1087,9 +1087,14 @@ class Sampler:
                     **sampler_kwargs,
                 )
 
-                self.sampler.run(
+                self.converged = self.sampler.run(
                     verbose=True, discard_exploration=discard_exploration, **run_kwargs
                 )
+                if not self.converged:
+                    print(
+                        "Warning. The nautilus run stopped on 'n_like_max' or 'timeout' and has not converged: "
+                        "the posterior and the evidence are not reliable."
+                    )
 
                 self.samples, weights, _ = self.sampler.posterior()
                 self.weights = np.exp(weights - np.max(weights))
@@ -1137,6 +1142,7 @@ class Sampler:
                 self.sampler = emcee.EnsembleSampler(
                     nwalkers, ndim, _mp_log_posterior, pool=pool, backend=backend, **sampler_kwargs
                 )
+                self.converged = None
 
                 # 'nsteps' is a total iteration target, not an increment: resuming
                 # only runs the remaining iterations needed to reach it.
