@@ -1357,7 +1357,7 @@ class Sampler:
     def save_best_model(self, plots=True, which="median", **kwargs):
         if not self.bbobj.modCalculated:
             print(
-                "Sampler has not been run yet. Please run compute() before running this function."
+                "Sampler has not been run yet. Please run run() before running this function."
             )
             return
 
