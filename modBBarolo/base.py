@@ -374,6 +374,11 @@ class Init(BayesianBBarolo):
                 bmaj_arr = _column("BMAJ", "arcsec", "arcsec")
                 bmin_arr = _column("BMIN", "arcsec", "arcsec")
                 bpa_arr  = _column("BPA", "deg", "deg")
+
+                # Rows are not guaranteed to be in channel order
+                if "CHAN" in beams.columns.names:
+                    order = np.argsort(np.asarray(beams.data["CHAN"]), kind="stable")
+                    bmaj_arr, bmin_arr, bpa_arr = bmaj_arr[order], bmin_arr[order], bpa_arr[order]
         except KeyError:
             bmaj_arr = np.array([hdr["BMAJ"] * 3600])
             bmin_arr = np.array([hdr["BMIN"] * 3600])
@@ -424,6 +429,8 @@ class Init(BayesianBBarolo):
                     self._beam_kernel /= self._beam_kernel.max()
                 else:
                     self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
+            else:
+                raise ValueError(f"Invalid value for 'normalize': {normalize!r}. Please use 'sum', 'peak' or None.")
 
 
     # -------------------------------------------------------------------------
@@ -455,7 +462,11 @@ class Init(BayesianBBarolo):
 
 
     def _build_fft_beam(self, center="stamp"):
-        _, ny, nx = self.data.shape
+        nchans, ny, nx = self.data.shape
+        if self._beam_kernel.ndim == 3 and self._beam_kernel.shape[0] != nchans:
+            raise ValueError(
+                f"The beam kernel has {self._beam_kernel.shape[0]} channels, but the data have {nchans}."
+            )
         image_shape = (ny, nx)
         kernel_shape = self._beam_kernel.shape[-2:]
 
