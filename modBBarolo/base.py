@@ -220,13 +220,23 @@ class Init(BayesianBBarolo):
         if boost is None or np.all(boost == 1.00):
             return self._render_model(rings, fullcube=fullcube)
 
-        # Boosted rings rendered apart with dens*factor, then divided by factor
+        options = {str(k).lower(): v for k, v in self._opts.opts.items()}
+        if int(options.get("cmode", 1)) != 1:
+            raise ValueError("'cdens_boost' requires cmode=1.")
+        cdens = float(options.get("cdens", 10.00))
+
+        # Boosted rings rendered apart with dens*scale, then divided by scale
         dens_saved = np.array(rings.r["dens"], dtype=np.float32, copy=True)
         boosted = 0.00
 
+        # Galmod never draws fewer than 10 clouds per pixel: boost from that floor
+        clouds = cdens * dens_saved.astype(np.float64)
+        floor = np.divide(10.00, clouds, out=np.ones_like(clouds), where=clouds > 0.00)
+        scale = np.where(boost != 1.00, boost * np.maximum(floor, 1.00), 1.00)
+
         try:
-            for factor in np.unique(boost[boost != 1.00]):
-                dens = np.where(boost == factor, dens_saved * factor, 0.00)
+            for factor in np.unique(scale[boost != 1.00]):
+                dens = np.where((boost != 1.00) & (scale == factor), dens_saved * factor, 0.00)
                 rings.modify_parameter("dens", dens, makeobj=True)
 
                 mod, _, _, galmod = self._render_model(rings, fullcube=fullcube)
