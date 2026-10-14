@@ -718,6 +718,13 @@ class Sampler:
             if center == "peak":
                 # A dirty beam is symmetric: its transform must be real
                 self.bbobj._symmetrize_beam()
+
+                peak = self.bbobj._beam_kernel.max(axis=(-2, -1))
+                if not np.allclose(peak, 1.00, rtol=1.00e-03):
+                    print(
+                        "Warning. 'NormalRI' expects a dirty beam with a unit peak, "
+                        f"but the kernel peaks at {np.max(peak):.3g}."
+                    )
             self.bbobj._build_fft_beam(center=center)
 
         for key in regularize.keys():
