@@ -483,6 +483,11 @@ class Sampler:
         moment_zero=None,
         regularize={"vdisp": 0.00}
     ):
+        if bbobj._galfit is not None:
+            raise RuntimeError(
+                "This Init object already belongs to a Sampler. Please create a new one."
+            )
+
         self.bbobj = bbobj
         self.free_params = free_params
         self._fit_rsep = "rsep" in free_params
