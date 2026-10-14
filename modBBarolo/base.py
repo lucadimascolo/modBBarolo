@@ -1302,11 +1302,16 @@ class Sampler:
 
         show_titles = kwargs.pop("show_titles", True)
 
-        corner_kwargs = {}
-        for key in inspect.signature(corner.corner).parameters.keys():
-            if key not in ["data", "weights", "labels", "show_titles", "range"]:
-                if key in kwargs:
-                    corner_kwargs[key] = kwargs.pop(key)
+        # corner.corner forwards unnamed options to hist2d and ignores unknown ones
+        internal = {"data", "xs", "x", "y", "weights", "labels", "range", "ax", "new_fig"}
+        allowed = set(inspect.signature(corner.corner).parameters) | set(inspect.signature(corner.hist2d).parameters)
+        allowed -= internal | {"kwargs", "hist2d_kwargs"}
+        if set(kwargs) & internal:
+            raise TypeError(f"save_corner() sets {sorted(set(kwargs) & internal)} internally")
+        unknown = sorted(set(kwargs) - allowed)
+        if unknown:
+            raise TypeError(f"Unrecognized arguments for save_corner(): {unknown}")
+        corner_kwargs = kwargs
 
         corner.corner(
             samples,
