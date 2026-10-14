@@ -1138,11 +1138,12 @@ class Sampler:
         if self.bbobj.update_prof:
             self.bbobj._update_profile(rings)
 
-        libBB.Galfit_setOutRings(self.bbobj._galfit, rings._rings)
-
-        _, ys, xs = self.bbobj.data.shape
-        bhi = (ctypes.c_int * 2)(xs, ys)
-        blo = (ctypes.c_int * 2)(0, 0)
+        # BBarolo's PV plot scripts fail on a ring at r=0: leave it out of the output rings
+        outri = rings
+        if rings.r["radii"][0] == 0.00:
+            outri = Rings(rings.nr - 1)
+            outri.set_rings_from_dict({key: values[1:] for key, values in rings.r.items()})
+        libBB.Galfit_setOutRings(self.bbobj._galfit, outri._rings)
 
         _, _, _, galmod = self.bbobj._render_model(rings, fullcube=True)
 
