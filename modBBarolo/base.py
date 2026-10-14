@@ -570,7 +570,7 @@ class Sampler:
             self.bbobj.prior_distr["vdisp"] = get_distribution("uniform", **distr_kw)
 
         # If the user set priors["vdisp"]["name"] == "constrained", vdisp is
-        # reparameterized as vdisp_i = vdisp_mu + tau * cumsum(z)_i, z_i ~ N(0, 1).
+        # reparameterized as a random walk anchored at vdisp_1 = vdisp_mu, z_i ~ N(0, 1).
         self._vdisp_constrained = (
             any(p.split("_")[0] == "vdisp" for p in free_params)
             and self.bbobj.priors["vdisp"]["name"] == "constrained"
@@ -580,11 +580,6 @@ class Sampler:
                 raise ValueError(
                     "The 'constrained' vdisp prior mode requires the bare 'vdisp' "
                     "free parameter (one value per ring), not 'vdisp_single'/'vdisp_func'."
-                )
-            if "radmax" in free_params:
-                raise ValueError(
-                    "'radmax' cannot be free with the 'constrained' vdisp prior mode: "
-                    "the random-walk steps are scaled to the initial ring grid."
                 )
             self.bbobj.prior_distr["vdisp"] = get_distribution("norm", loc=0.00, scale=1.00)
 
@@ -719,7 +714,8 @@ class Sampler:
 
             # Random-walk variance proportional to the radial step
             steps = np.diff(np.asarray(self.bbobj.radii, dtype=np.float64))
-            self._walk_weight = np.sqrt(steps / steps.max())
+            self._walk_steps = steps / steps.max()
+            self._walk_ref = steps.max()
 
         self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
 
@@ -916,18 +912,27 @@ class Sampler:
     def _physical_theta(self, theta):
         """Map sampled vectors (last axis) to the physical layout. In the 'constrained'
         vdisp mode vdisp_1 = vdisp_mu and vdisp_i = vdisp_mu + tau * sum_{j<=i} w_j z_j,
-        with w_j the square root of the radial step in units of the largest one."""
+        with w_j the square root of the radial step in units of the largest initial one."""
         if not self._vdisp_constrained:
             return theta
         theta = np.asarray(theta, dtype=np.float64)
         phys = np.insert(theta, int(self._phys_idx["vdisp"][0]), 0.00, axis=-1)
 
-        z = theta[..., self.freepar_idx["vdisp"]] * self._walk_weight
+        z = theta[..., self.freepar_idx["vdisp"]] * self._walk_weight(theta)
         mu = theta[..., self.freepar_idx["vdisp_mu"], None]
         tau = theta[..., self.freepar_idx["tau"], None]
         steps = np.concatenate([np.zeros(z.shape[:-1] + (1,)), z], axis=-1)
         phys[..., self._phys_idx["vdisp"]] = mu + tau * np.cumsum(steps, axis=-1)
         return phys
+
+    def _walk_weight(self, theta):
+        """Random-walk weights for sampled vectors (last axis). A free radmax moves the
+        last ring, so the last step follows it; a free rsep leaves the ratios unchanged."""
+        steps = np.broadcast_to(self._walk_steps, theta.shape[:-1] + self._walk_steps.shape).copy()
+        if "radmax" in self.freepar_idx and self._walk_steps.size:
+            radmax = theta[..., np.atleast_1d(self.freepar_idx["radmax"])[0]]
+            steps[..., -1] = (radmax - self.bbobj.radii[-2]) / self._walk_ref
+        return np.sqrt(np.clip(steps, 0.00, None))
 
     # -----------------------------------------------------------------------------
     # - Ring radii for a given separation, as built by Init.initialize()
@@ -1236,7 +1241,7 @@ class Sampler:
             tau = self.params[self.freepar_idx["tau"]]
             self.params[self.freepar_idx["vdisp_mu"]] = vdisp[0]
             self.params[self.freepar_idx["vdisp"]] = (
-                np.diff(vdisp) / (tau * self._walk_weight) if tau > 0.00 else 0.00
+                np.diff(vdisp) / (tau * self._walk_weight(self.params)) if tau > 0.00 else 0.00
             )
 
         self.bbobj.params = self._physical_theta(self.params)[: len(self.bbobj.freepar_names)]
