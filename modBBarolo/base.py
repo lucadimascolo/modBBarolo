@@ -989,6 +989,33 @@ class Sampler:
             setattr(self, key, value)
         self._log_likelihood = types.MethodType(self._likelihood._compute.__func__, self)
 
+    # -----------------------------------------------------------------------------
+    # - Checkpoints must match the current parameter layout
+    # -----------------------------------------------------------------------------
+    def _check_checkpoint(self, filepath, resume, method):
+        import h5py
+        import os
+
+        # nautilus does not compare the dimensions when resuming
+        names = f"{os.path.splitext(filepath)[0]}_params.txt"
+        if resume and os.path.exists(filepath):
+            stored = None
+            if os.path.exists(names):
+                with open(names) as f:
+                    stored = f.read().split()
+            elif method == "nautilus":
+                with h5py.File(filepath, "r") as f:
+                    if "sampler" in f:
+                        stored = int(f["sampler"].attrs["n_dim"])
+
+            current = self.freepar_names if isinstance(stored, list) else len(self.freepar_names)
+            if stored is not None and stored != current:
+                raise ValueError(
+                    f"The checkpoint {filepath} was written for other free parameters ({stored}), "
+                    f"not {current}. Delete it, or resume with the parameters it was written for."
+                )
+        with open(names, "w") as f:
+            f.write("\n".join(self.freepar_names) + "\n")
 
     # -----------------------------------------------------------------------------
     # - Main method to run the sampler
@@ -1046,6 +1073,8 @@ class Sampler:
                     )
 
                 filepath = f"{self.output}_checkpoint.h5" if checkpoint else None
+                if checkpoint:
+                    self._check_checkpoint(filepath, resume, "nautilus")
 
                 self.sampler = nautilus.Sampler(
                     prior=_mp_prior_transform,
@@ -1098,6 +1127,7 @@ class Sampler:
                     )
 
                 if checkpoint:
+                    self._check_checkpoint(f"{self.output}_checkpoint_emcee.h5", resume, "emcee")
                     backend = emcee.backends.HDFBackend(f"{self.output}_checkpoint_emcee.h5")
                     if not resume:
                         backend.reset(nwalkers, ndim)
