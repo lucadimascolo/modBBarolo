@@ -180,6 +180,27 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
+    # - Ring densities from Ellprof, without sign flips or an empty centre
+    # -------------------------------------------------------------------------
+    def _update_profile(self, rings):
+        libBB.Ellprof_update_rings(self._ellprof, rings._rings)
+        libBB.Ellprof_compute(self._ellprof)
+        dens = reshapePointer(libBB.Ellprof_dens_array(self._ellprof), (1, rings.nr))[0]
+        dens = np.array(dens, dtype=np.float64)
+
+        # The annulus of a ring at r=0 can hold no pixel
+        if rings.nr > 1 and rings.r["radii"][0] == 0.00 and not np.abs(dens[0]) > 0.00:
+            dens[0] = dens[1]
+
+        # Negative ring means are floored: Galmod skips rings with zero density
+        peak = np.nanmax(dens) if np.any(np.isfinite(dens)) else 0.00
+        floor = 1.00e-03 * max(peak, 0.00)
+        dens = np.where(np.isfinite(dens) & (dens > floor), dens, floor)
+
+        rings.modify_parameter("dens", dens, makeobj=True)
+
+
+    # -------------------------------------------------------------------------
     # - Rings handed to Galmod, with explicit nodes at the model edges
     # -------------------------------------------------------------------------
     def _padded_rings(self, rings):
