@@ -686,6 +686,27 @@ class Sampler:
 
         self._likelihood = likelihood if not isinstance(likelihood, type) else likelihood()
 
+        # Reference maps: the dirty data cannot normalize the clean model of NormalRI
+        if self.method_norm in ["flux", "local"] and self.moment_zero is None:
+            if isinstance(self._likelihood, NormalRI):
+                raise ValueError(
+                    f"'NormalRI' with '{self.method_norm}' requires a clean 'moment_zero': the dirty "
+                    "data overestimate the flux by the PSF sum. Pass one, or use 'constant'."
+                )
+            if self.method_norm == "local":
+                print(
+                    "Warning. 'local' without a 'moment_zero' scales the unconvolved model "
+                    "against the beam-convolved data."
+                )
+
+        if self.method_norm == "flux":
+            reference = self.moment_zero_data if self.moment_zero is None else self.moment_zero
+            self._reference_flux = float(np.nansum(reference))
+            if not self._reference_flux > 0.00:
+                raise ValueError(
+                    f"The total flux of the reference map is {self._reference_flux:.3g}: 'flux' needs a positive one."
+                )
+
         if self.bbobj._beam_kernel is None:
             print(
                 "Warning. No beam kernel has been built. If your data is beam-convolved, "
@@ -742,17 +763,28 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Model normalization
     # -----------------------------------------------------------------------------
-    def _normalize_model(self, model, data, mask, **kwargs):
-        if self.method_norm == "flux":
-            return model * np.nansum(data * mask) / np.nansum(model * mask)
-        elif self.method_norm == "local":
-            model_ = np.nansum(model * mask, axis=0)
+    def _normalize_model(self, model, **kwargs):
+        if self.method_norm in ["flux", "local"]:
+            # Unmasked model sums: the mask only enters the default reference
+            model_ = np.nansum(model, axis=0)
+            if not np.nansum(model_) > 0.00:
+                return None
+
+            if self.method_norm == "flux":
+                # Total flux of the reference map, independent of the model footprint
+                return model * self._reference_flux / np.nansum(model_)
+
             ratio = np.divide(
-                kwargs["moment_zero"], model_, out=np.zeros_like(model_), where=model_ != 0
+                kwargs["moment_zero"], model_, out=np.zeros(model_.shape), where=model_ != 0
             )
-            return model * ratio
-        elif self.method_norm == "constant":
-            return kwargs["norm"] * model * mask
+            model = model * np.nan_to_num(ratio)
+            return model if np.nansum(model) > 0.00 else None
+
+        # No emission to scale: the model is empty
+        if not np.nansum(model) > 0.00:
+            return None
+        if self.method_norm == "constant":
+            return kwargs["norm"] * model
         elif self.method_norm == "exponential":
             norm = kwargs["norm"]
             rdisk = kwargs["rdisk"]
@@ -772,7 +804,7 @@ class Sampler:
             yr = (-(xx - x0) * np.cos(phi) - (yy - y0) * np.sin(phi)) / np.cos(inc)
             R = np.sqrt(xr**2 + yr**2) * self.pixscale
 
-            return model * mask * norm * np.exp(-R[None, :, :] / rdisk)
+            return model * norm * np.exp(-R[None, :, :] / rdisk)
 
     # -----------------------------------------------------------------------------
     # - Prior Transform for nested sampler
@@ -895,44 +927,38 @@ class Sampler:
         # Calculate the model and the boundaries
         model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
 
-        # Extract mask and data arrays
-        mask = self.bbobj.mask
-        data = self.data
-
-        mask_ = mask[:, blo[1] : bhi[1], blo[0] : bhi[0]]
-        data_ = data[:, blo[1] : bhi[1], blo[0] : bhi[0]]
-
-        kwargs = {}
-        if self.method_norm == "constant":
-            kwargs["norm"] = theta[self.freepar_idx["norm"]]
-        elif self.method_norm == "exponential":
-            kwargs["norm"] = theta[self.freepar_idx["norm"]]
-            kwargs["rdisk"] = theta[self.freepar_idx["rdisk"]]
-            kwargs["rings"] = rings
-            kwargs["bhi"], kwargs["blo"] = bhi, blo
-        elif self.method_norm == "local":
-            if self.moment_zero is None:
-                kwargs["moment_zero"] = self.moment_zero_data.copy()
+        try:
+            kwargs = {}
+            if self.method_norm == "constant":
+                kwargs["norm"] = theta[self.freepar_idx["norm"]]
+            elif self.method_norm == "exponential":
+                kwargs["norm"] = theta[self.freepar_idx["norm"]]
+                kwargs["rdisk"] = theta[self.freepar_idx["rdisk"]]
+                kwargs["rings"] = rings
+                kwargs["bhi"], kwargs["blo"] = bhi, blo
             else:
-                kwargs["moment_zero"] = self.moment_zero[blo[1] : bhi[1], blo[0] : bhi[0]]
-            
-        if self.method_norm in ["constant", "exponential"] or \
-          (self.method_norm == "local" and self.moment_zero is not None):
-            model_ = self._normalize_model(model_, data_, mask_, **kwargs)
+                # Reference map: the user-provided one or, by default, the data
+                moment_zero = self.moment_zero_data if self.moment_zero is None else self.moment_zero
+                kwargs["moment_zero"] = moment_zero[blo[1] : bhi[1], blo[0] : bhi[0]]
 
-        model = np.zeros(data.shape)
-        model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_.copy()
+            # The normalization always applies to the unconvolved model
+            model_ = self._normalize_model(model_, **kwargs)
+
+            # No flux to scale, or a non-finite model
+            if model_ is None or not np.all(np.isfinite(model_)):
+                return -np.inf
+
+            model = np.zeros(self.data.shape)
+            model[:, blo[1] : bhi[1], blo[0] : bhi[0]] = model_
+        finally:
+            libBB.Galmod_delete(galmod)
 
         if convolve:
             model = self._smooth_model(model)
 
-        if self.method_norm == "flux" or \
-          (self.method_norm == "local" and self.moment_zero is None):
-            model = self._normalize_model(model, data, mask, **kwargs)
+        return model, self.data, self.bbobj.mask
 
-        libBB.Galmod_delete(galmod)
 
-        return model, data, mask
 
     # -----------------------------------------------------------------------------
     # - Main method to run the sampler
