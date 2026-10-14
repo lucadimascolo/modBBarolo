@@ -1104,6 +1104,7 @@ class Sampler:
                 nsteps = kwargs.pop("nsteps", 5000)
                 discard = kwargs.pop("discard", 0)
                 thin = kwargs.pop("thin", 1)
+                seed = kwargs.pop("seed", None)
 
                 sampler_kwargs = {}
                 for key in inspect.signature(emcee.EnsembleSampler).parameters.keys():
@@ -1144,6 +1145,9 @@ class Sampler:
                 )
                 self.converged = None
 
+                # Own random streams, leaving the global NumPy state untouched
+                rng = np.random if seed is None else np.random.default_rng(seed)
+
                 # 'nsteps' is a total iteration target, not an increment: resuming
                 # only runs the remaining iterations needed to reach it.
                 completed = backend.iteration if backend is not None and backend.initialized else 0
@@ -1152,8 +1156,10 @@ class Sampler:
                 if completed > 0:
                     initial_state = None
                 else:
+                    if seed is not None:
+                        self.sampler._random = np.random.RandomState(seed)
                     initial_state = np.array(
-                        [self._prior_transform(np.random.uniform(size=ndim)) for _ in range(nwalkers)]
+                        [self._prior_transform(rng.uniform(size=ndim)) for _ in range(nwalkers)]
                     )
 
                 if remaining > 0:
