@@ -530,6 +530,11 @@ class Sampler:
         self.free_params = free_params
         self._fit_rsep = "rsep" in free_params
 
+        if self._fit_rsep and "radmax" in free_params:
+            raise ValueError(
+                "'radmax' and 'rsep' cannot both be free: the 'radmax' prior refers to the initial ring grid."
+            )
+
         self.output = output
         if self.output is None:
             self.output = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -875,6 +880,14 @@ class Sampler:
         for k in self._func_params:
             if k in is_positive and np.any(rings.r[k] < 0):
                 return -np.inf
+
+        # BBarolo aborts on rings that are too close or on a centre outside the map
+        if np.any(np.diff(rings.r["radii"].astype(np.float64)) <= self.bbobj._min_node_sep * (1.00 + 1.00e-06)):
+            return -np.inf
+        _, ny, nx = self.data.shape
+        xpos, ypos = np.mean(rings.r["xpos"]), np.mean(rings.r["ypos"])
+        if not (0.00 <= xpos < nx and 0.00 <= ypos < ny):
+            return -np.inf
 
         if self.bbobj.update_prof:
             self.bbobj._update_profile(rings)
