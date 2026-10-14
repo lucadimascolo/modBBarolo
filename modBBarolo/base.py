@@ -1126,8 +1126,9 @@ class Sampler:
                         "the posterior and the evidence are not reliable."
                     )
 
-                self.samples, weights, _ = self.sampler.posterior()
+                self.samples, weights, self.log_l = self.sampler.posterior()
                 self.weights = np.exp(weights - np.max(weights))
+                self.log_z = self.sampler.log_z
 
             elif method == "emcee":
                 nwalkers = kwargs.pop("nwalkers", max(4 * ndim, 20))
@@ -1201,6 +1202,12 @@ class Sampler:
 
                 self.samples = self.sampler.get_chain(discard=discard, thin=thin, flat=True)
                 self.weights = np.ones(len(self.samples))
+                self.log_z = None
+
+                # emcee stores the log-posterior: remove the prior
+                log_post = self.sampler.get_log_prob(discard=discard, thin=thin, flat=True)
+                with np.errstate(invalid="ignore"):
+                    self.log_l = log_post - np.array([self._log_prior(t) for t in self.samples])
         except BaseException:
             if pool is not None:
                 pool.terminate()
@@ -1213,6 +1220,12 @@ class Sampler:
         self.params = np.array(
             [corner.quantile(s, 0.50, weights=self.weights)[0] for s in self.samples.T]
         )
+
+        # Best samples, next to the vector of marginal medians
+        self.log_l = np.where(np.isnan(self.log_l), -np.inf, self.log_l)
+        log_prior = np.array([self._log_prior(t) for t in self.samples])
+        self.params_maxlike = self.samples[np.argmax(self.log_l)].copy()
+        self.params_maxpost = self.samples[np.argmax(self.log_l + log_prior)].copy()
 
         if self._vdisp_constrained:
             # z values mapping onto the median physical vdisp
@@ -1228,6 +1241,12 @@ class Sampler:
 
         self.bbobj.params = self._physical_theta(self.params)[: len(self.bbobj.freepar_names)]
         self.bbobj.modCalculated = True
+
+        self.log_l_median = self._log_likelihood(self.params)
+        print(
+            f"Log-likelihood at the median parameters: {self.log_l_median:.2f}; "
+            f"maximum over the samples: {self.log_l.max():.2f}"
+        )
 
     # -----------------------------------------------------------------------------
     # - Collapse z-space vdisp samples to physical per-ring vdisp for reporting
@@ -1326,21 +1345,26 @@ class Sampler:
     # -----------------------------------------------------------------------------
     # - Save best-fit model and outputs using the best-fit parameters
     # -----------------------------------------------------------------------------
-    def save_best_model(self, plots=True, **kwargs):
+    def save_best_model(self, plots=True, which="median", **kwargs):
         if not self.bbobj.modCalculated:
             print(
                 "Sampler has not been run yet. Please run compute() before running this function."
             )
             return
 
-        model_out = self._get_model(self.params, convolve=True)
+        choices = {"median": "params", "maxlike": "params_maxlike", "maxpost": "params_maxpost"}
+        if which not in choices:
+            raise ValueError(f"Invalid value for 'which': {which!r}. Please use one of: {list(choices)}")
+        theta = getattr(self, choices[which])
+
+        model_out = self._get_model(theta, convolve=True)
         if not isinstance(model_out, tuple):
             raise ValueError(
                 "The best-fit parameters fall outside the allowed range: no model can be built."
             )
         model = model_out[0]
 
-        rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(self.params))
+        rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(theta))
 
         if self.bbobj.update_prof:
             self.bbobj._update_profile(rings)
