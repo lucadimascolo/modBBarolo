@@ -388,6 +388,34 @@ class Init(BayesianBBarolo):
                     self._beam_kernel /= self._beam_kernel.max(axis=(-2, -1), keepdims=True)
 
 
+    # -------------------------------------------------------------------------
+    # - Crop the kernel to the largest window symmetric about its peak
+    # -------------------------------------------------------------------------
+    def _symmetrize_beam(self):
+        stack = self._beam_kernel.ndim == 3
+        kernel = self._beam_kernel if stack else self._beam_kernel[None]
+        ny, nx = kernel.shape[-2:]
+
+        peaks = [np.unravel_index(np.argmax(k), k.shape) for k in kernel]
+        hy = min(min(y0, ny - 1 - y0) for y0, _ in peaks)
+        hx = min(min(x0, nx - 1 - x0) for _, x0 in peaks)
+        if hy < 1 or hx < 1:
+            raise ValueError("The beam kernel peaks on the edge of its stamp: it cannot be symmetrized.")
+
+        kernel = np.stack([
+            k[y0 - hy : y0 + hy + 1, x0 - hx : x0 + hx + 1] for k, (y0, x0) in zip(kernel, peaks)
+        ])
+
+        if kernel.shape[-2:] != (ny, nx):
+            print(f"Beam kernel cropped from {(ny, nx)} to {kernel.shape[-2:]} to be symmetric about its peak.")
+
+        asym = np.abs(kernel - kernel[:, ::-1, ::-1]).max() / np.abs(kernel).max()
+        if asym > 1.00e-03:
+            print(f"Warning. The beam kernel is not symmetric about its peak (up to {asym:.1e} of the peak).")
+
+        self._beam_kernel = kernel if stack else kernel[0]
+
+
     def _build_fft_beam(self, center="stamp"):
         _, ny, nx = self.data.shape
         image_shape = (ny, nx)
@@ -604,6 +632,9 @@ class Sampler:
         else:
             # Same convention as socca
             center = "peak" if isinstance(self._likelihood, NormalRI) else "stamp"
+            if center == "peak":
+                # A dirty beam is symmetric: its transform must be real
+                self.bbobj._symmetrize_beam()
             self.bbobj._build_fft_beam(center=center)
 
         for key in regularize.keys():
