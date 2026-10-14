@@ -47,8 +47,30 @@ _methods = ["nautilus", "emcee"]
 # -----------------------------------------------------------------------------
 # Initialize BBarolo
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Signed pixel size (arcsec) along x and y, read as BBarolo does
+# -----------------------------------------------------------------------------
+def _pixel_size(fitsname):
+    hdr = fits.getheader(fitsname)
+    if "CDELT1" in hdr and "CDELT2" in hdr:
+        return 3600.00 * np.array([hdr["CDELT1"], hdr["CDELT2"]], dtype=np.float64)
+    if "CD1_1" in hdr and "CD2_2" in hdr:
+        # BBarolo falls back to the CD matrix only when no axis has a CDELT
+        if any(key.startswith("CDELT") for key in hdr):
+            raise ValueError(
+                "The header mixes CDELT keywords with a CD matrix, which BBarolo cannot read: "
+                "give CDELT1 and CDELT2, or remove every CDELT keyword."
+            )
+        return 3600.00 * np.array([hdr["CD1_1"], hdr["CD2_2"]], dtype=np.float64)
+    raise ValueError("The header has neither CDELT1/CDELT2 nor CD1_1/CD2_2: the pixel size is unknown.")
+
+
 class Init(BayesianBBarolo):
     def __init__(self, fitsname, beam=None, normalize_beam=None, *args, **kwargs):
+        self._pixsize = _pixel_size(fitsname)
+        if self._pixsize[0] > 0.00:
+            print("Warning. CDELT1 is positive: BBarolo expects RA to decrease along x and does not handle it consistently.")
+
         super().__init__(fitsname, *args, **kwargs)
 
         self._beam_kernel = None
@@ -61,11 +83,7 @@ class Init(BayesianBBarolo):
         self._pad_rings = None
 
         # Galmod needs ring nodes more than 0.75 pixels apart
-        try:
-            hdr = fits.getheader(fitsname)
-            self._min_node_sep = 0.75 * 3600 * min(abs(hdr["CDELT1"]), abs(hdr["CDELT2"]))
-        except KeyError:
-            self._min_node_sep = 0.00
+        self._min_node_sep = 0.75 * np.abs(self._pixsize).min()
         self._vrot_r0_removed_idx = None
         self._full_freepar_idx = None
 
@@ -320,8 +338,7 @@ class Init(BayesianBBarolo):
         (read from a BEAMS binary-table extension, CASA convention).
         """
         hdr = fits.getheader(self.inp.fname)
-        pixsizeX = abs(hdr["CDELT1"]) * 3600  # degrees -> arcsec
-        pixsizeY = abs(hdr["CDELT2"]) * 3600  # degrees -> arcsec
+        pixsizeX, pixsizeY = np.abs(self._pixsize)
 
         # Per-channel beam: CASA writes a BEAMS binary-table extension
         try:
@@ -601,9 +618,13 @@ class Sampler:
             )
 
         elif self.method_norm == "exponential":
-            hdr = fits.getheader(self.bbobj.inp.fname)
-            self.pixscale = abs(hdr["CDELT2"]) * 3600
-            del hdr
+            # The deprojection below assumes Galmod's standard grid
+            pixsize = self.bbobj._pixsize
+            if pixsize[0] > 0.00 or not np.isclose(abs(pixsize[0]), abs(pixsize[1]), rtol=1.00e-06):
+                raise ValueError(
+                    "The 'exponential' normalization requires square pixels and a negative CDELT1."
+                )
+            self.pixscale = abs(pixsize[1])
 
             for pname in ("norm", "rdisk"):
                 self.freepar_names.append(pname)
