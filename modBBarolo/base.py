@@ -191,7 +191,7 @@ class Init(BayesianBBarolo):
     # -------------------------------------------------------------------------
     # - Rings handed to Galmod, with explicit nodes at the model edges
     # -------------------------------------------------------------------------
-    def _padded_rings(self, rings):
+    def _padded_rings(self, rings, profile=None):
         radii = np.asarray(rings.r["radii"], dtype=np.float64)
 
         # Ring centres sit at odd multiples of rsep/2
@@ -207,6 +207,9 @@ class Init(BayesianBBarolo):
             [[0.00] if inner else [], radii, [radii[-1] + 0.50 * rsep]]
         )
 
+        if profile is not None:
+            padded = self._profile_nodes(padded, profile)
+
         if self._pad_rings is None or self._pad_rings.nr != len(padded["radii"]):
             self._pad_rings = Rings(len(padded["radii"]))
         for key, values in padded.items():
@@ -217,11 +220,31 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
+    # - Nodes about 2 pixels apart carrying the exact radial profile
+    # -------------------------------------------------------------------------
+    def _profile_nodes(self, padded, profile):
+        nodes = padded["radii"]
+        step = 2.00 * np.abs(self._pixsize).min()
+
+        # Galmod interpolates linearly: the other parameters are unchanged by the extra nodes
+        radii = [nodes[:1]]
+        for a, b in zip(nodes[:-1], nodes[1:]):
+            n = max(1, int(np.floor((b - a) / step)))
+            radii.append(np.linspace(a, b, n + 1)[1:])
+        radii = np.concatenate(radii)
+
+        dense = {key: np.interp(radii, nodes, np.asarray(values, dtype=np.float64)) for key, values in padded.items()}
+        dense["radii"] = radii
+        dense["dens"] = dense["dens"] * profile(radii)
+        return dense
+
+
+    # -------------------------------------------------------------------------
     # - Render the rings with their values at the nominal radii
     # -------------------------------------------------------------------------
-    def _render_model(self, rings, fullcube=False):
+    def _render_model(self, rings, fullcube=False, profile=None):
         # finalModel=False: BBarolo would otherwise shift the first and last ring
-        padded = self._padded_rings(rings)
+        padded = self._padded_rings(rings, profile=profile)
 
         _, ys, xs = self.data.shape
         if fullcube:
@@ -242,10 +265,10 @@ class Init(BayesianBBarolo):
     # -------------------------------------------------------------------------
     # - Calculate model, drawing more clouds in the cdens_boost rings
     # -------------------------------------------------------------------------
-    def _calculate_model(self, rings, fullcube=False):
+    def _calculate_model(self, rings, fullcube=False, profile=None):
         boost = self._cdens_boost
         if boost is None or np.all(boost == 1.00):
-            return self._render_model(rings, fullcube=fullcube)
+            return self._render_model(rings, fullcube=fullcube, profile=profile)
 
         options = {str(k).lower(): v for k, v in self._opts.opts.items()}
         if int(options.get("cmode", 1)) != 1:
@@ -258,6 +281,8 @@ class Init(BayesianBBarolo):
 
         # Galmod never draws fewer than 10 clouds per pixel: boost from that floor
         clouds = cdens * dens_saved.astype(np.float64)
+        if profile is not None:
+            clouds = clouds * profile(np.asarray(rings.r["radii"], dtype=np.float64))
         floor = np.divide(10.00, clouds, out=np.ones_like(clouds), where=clouds > 0.00)
         scale = np.where(boost != 1.00, boost * np.maximum(floor, 1.00), 1.00)
 
@@ -266,14 +291,14 @@ class Init(BayesianBBarolo):
                 dens = np.where((boost != 1.00) & (scale == factor), dens_saved * factor, 0.00)
                 rings.modify_parameter("dens", dens, makeobj=True)
 
-                mod, _, _, galmod = self._render_model(rings, fullcube=fullcube)
+                mod, _, _, galmod = self._render_model(rings, fullcube=fullcube, profile=profile)
                 boosted = boosted + mod / factor
                 libBB.Galmod_delete(galmod)
 
             dens = np.where(boost == 1.00, dens_saved, 0.00)
             rings.modify_parameter("dens", dens, makeobj=True)
 
-            mod, bhi, blo, galmod = self._render_model(rings, fullcube=fullcube)
+            mod, bhi, blo, galmod = self._render_model(rings, fullcube=fullcube, profile=profile)
             mod += boosted
             return mod, bhi, blo, galmod
         finally:
@@ -631,14 +656,6 @@ class Sampler:
             )
 
         elif self.method_norm == "exponential":
-            # The deprojection below assumes Galmod's standard grid
-            pixsize = self.bbobj._pixsize
-            if pixsize[0] > 0.00 or not np.isclose(abs(pixsize[0]), abs(pixsize[1]), rtol=1.00e-06):
-                raise ValueError(
-                    "The 'exponential' normalization requires square pixels and a negative CDELT1."
-                )
-            self.pixscale = abs(pixsize[1])
-
             for pname in ("norm", "rdisk"):
                 self.freepar_names.append(pname)
                 self.freepar_idx[pname] = len(self.freepar_names) - 1
@@ -805,28 +822,17 @@ class Sampler:
         # No emission to scale: the model is empty
         if not np.nansum(model) > 0.00:
             return None
-        if self.method_norm == "constant":
-            return kwargs["norm"] * model
-        elif self.method_norm == "exponential":
-            norm = kwargs["norm"]
-            rdisk = kwargs["rdisk"]
-            rings = kwargs["rings"]
-            bhi, blo = kwargs["bhi"], kwargs["blo"]
+        # "exponential": the radial profile is already in the ring densities
+        return kwargs["norm"] * model
 
-            x0 = np.mean(rings.r["xpos"])
-            y0 = np.mean(rings.r["ypos"])
-            inc = np.radians(np.mean(rings.r["inc"]))
-            phi = np.radians(np.mean(rings.r["phi"]))
-
-            x = np.arange(blo[0], bhi[0])
-            y = np.arange(blo[1], bhi[1])
-            xx, yy = np.meshgrid(x, y)
-
-            xr = -(xx - x0) * np.sin(phi) + (yy - y0) * np.cos(phi)
-            yr = (-(xx - x0) * np.cos(phi) - (yy - y0) * np.sin(phi)) / np.cos(inc)
-            R = np.sqrt(xr**2 + yr**2) * self.pixscale
-
-            return model * norm * np.exp(-R[None, :, :] / rdisk)
+    # -----------------------------------------------------------------------------
+    # - Radial profile rendered by Galmod, in the disk plane
+    # -----------------------------------------------------------------------------
+    def _radial_profile(self, theta):
+        if self.method_norm != "exponential":
+            return None
+        rdisk = theta[self._phys_idx["rdisk"]]
+        return lambda radii: np.exp(-radii / rdisk)
 
     # -----------------------------------------------------------------------------
     # - Prior Transform for nested sampler
@@ -957,17 +963,12 @@ class Sampler:
             return -np.inf
 
         # Calculate the model and the boundaries
-        model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
+        model_, bhi, blo, galmod = self.bbobj._calculate_model(rings, profile=self._radial_profile(theta))
 
         try:
             kwargs = {}
-            if self.method_norm == "constant":
+            if self.method_norm in ["constant", "exponential"]:
                 kwargs["norm"] = theta[idx["norm"]]
-            elif self.method_norm == "exponential":
-                kwargs["norm"] = theta[idx["norm"]]
-                kwargs["rdisk"] = theta[idx["rdisk"]]
-                kwargs["rings"] = rings
-                kwargs["bhi"], kwargs["blo"] = bhi, blo
             else:
                 # Reference map: the user-provided one or, by default, the data
                 moment_zero = self.moment_zero_data if self.moment_zero is None else self.moment_zero
@@ -1359,11 +1360,16 @@ class Sampler:
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(theta))
 
+        # Output rings with the densities Galmod rendered
+        values = {key: np.array(value) for key, value in rings.r.items()}
+        profile = self._radial_profile(self._physical_theta(theta))
+        if profile is not None:
+            values["dens"] = values["dens"] * profile(values["radii"].astype(np.float64))
+
         # BBarolo's PV plot scripts fail on a ring at r=0: leave it out of the output rings
-        outri = rings
-        if rings.r["radii"][0] == 0.00:
-            outri = Rings(rings.nr - 1)
-            outri.set_rings_from_dict({key: values[1:] for key, values in rings.r.items()})
+        first = 1 if rings.r["radii"][0] == 0.00 else 0
+        outri = Rings(rings.nr - first)
+        outri.set_rings_from_dict({key: value[first:] for key, value in values.items()})
         libBB.Galfit_setOutRings(self.bbobj._galfit, outri._rings)
 
         _, _, _, galmod = self.bbobj._render_model(rings, fullcube=True)
