@@ -180,24 +180,12 @@ class Init(BayesianBBarolo):
 
 
     # -------------------------------------------------------------------------
-    # - Ring densities from Ellprof, without sign flips or an empty centre
+    # - Ring densities: those given to init(), never derived from the data
     # -------------------------------------------------------------------------
     def _update_profile(self, rings):
-        libBB.Ellprof_update_rings(self._ellprof, rings._rings)
-        libBB.Ellprof_compute(self._ellprof)
-        dens = reshapePointer(libBB.Ellprof_dens_array(self._ellprof), (1, rings.nr))[0]
-        dens = np.array(dens, dtype=np.float64)
-
-        # The annulus of a ring at r=0 can hold no pixel
-        if rings.nr > 1 and rings.r["radii"][0] == 0.00 and not np.abs(dens[0]) > 0.00:
-            dens[0] = dens[1]
-
-        # Negative ring means are floored: Galmod skips rings with zero density
-        peak = np.nanmax(dens) if np.any(np.isfinite(dens)) else 0.00
-        floor = 1.00e-03 * max(peak, 0.00)
-        dens = np.where(np.isfinite(dens) & (dens > floor), dens, floor)
-
-        rings.modify_parameter("dens", dens, makeobj=True)
+        dens = np.asarray(rings.r["dens"], dtype=np.float64)
+        if not np.all(np.isfinite(dens) & (dens > 0.00)):
+            raise ValueError("The ring densities ('dens' in init) must be positive and finite.")
 
 
     # -------------------------------------------------------------------------
@@ -589,12 +577,6 @@ class Sampler:
             [p for p in self.free_params if p != "rsep"], useBBres=False
         )
 
-        self.bbobj.update_prof = self._fit_rsep or any(
-            sub in string
-            for string in self.bbobj.freepar_names
-            for sub in ["inc", "phi", "xpos", "ypos", "radmax"]
-        )
-
         if self.bbobj.mask is None:
             self.bbobj.mask = np.ones_like(self.bbobj.data, dtype=bool)
 
@@ -973,9 +955,6 @@ class Sampler:
         xpos, ypos = np.mean(rings.r["xpos"]), np.mean(rings.r["ypos"])
         if not (0.00 <= xpos < nx and 0.00 <= ypos < ny):
             return -np.inf
-
-        if self.bbobj.update_prof:
-            self.bbobj._update_profile(rings)
 
         # Calculate the model and the boundaries
         model_, bhi, blo, galmod = self.bbobj._calculate_model(rings)
@@ -1379,9 +1358,6 @@ class Sampler:
         model = model_out[0]
 
         rings = self.bbobj._update_rings(self.bbobj._inri, self._physical_theta(theta))
-
-        if self.bbobj.update_prof:
-            self.bbobj._update_profile(rings)
 
         # BBarolo's PV plot scripts fail on a ring at r=0: leave it out of the output rings
         outri = rings
